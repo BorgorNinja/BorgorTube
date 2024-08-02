@@ -1,8 +1,8 @@
-# YouTubeClient
+# BorgorTube
 
 ## Overview
 
-`YouTubeClient` is a desktop application that allows users to search for YouTube videos, view search results, and watch selected videos using MPV media player. The application is built with PyQt5 and integrates with YouTube's API to fetch and display video information.
+BorgorTube is a desktop application that allows users to search for YouTube videos, view search results, and watch selected videos using MPV media player. The application is built with PyQt5 and integrates with YouTube's API to fetch and display video information.
 
 ## Features
 

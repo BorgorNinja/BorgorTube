@@ -3,13 +3,15 @@ import subprocess
 import re
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton,
                              QLineEdit, QTextEdit, QLabel, QProgressBar, QFileDialog, QComboBox,
-                             QHBoxLayout, QListWidget, QListWidgetItem, QMenu, QAction, QSystemTrayIcon, QMessageBox)
+                             QHBoxLayout, QListWidget, QListWidgetItem, QMenu, QAction, QSystemTrayIcon, QMessageBox,
+                             QScrollArea, QDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QProcess
-from PyQt5.QtGui import QPixmap, QIcon
+from PyQt5.QtGui import QPixmap, QIcon, QPalette, QColor
 import requests
-from bs4 import BeautifulSoup
 import json
 import os
+from bs4 import BeautifulSoup
+import concurrent.futures
 
 class YouTubeClient(QMainWindow):
     def __init__(self):
@@ -58,6 +60,11 @@ class YouTubeClient(QMainWindow):
         self.watch_button.clicked.connect(self.watch_video)
         self.left_layout.addWidget(self.watch_button)
 
+        self.show_comments_button = QPushButton('Show Comments', self)
+        self.show_comments_button.setVisible(False)
+        self.show_comments_button.clicked.connect(self.show_comments)
+        self.left_layout.addWidget(self.show_comments_button)
+
         self.next_page_button = QPushButton('Next Page', self)
         self.next_page_button.setVisible(False)
         self.next_page_button.clicked.connect(self.next_page)
@@ -67,6 +74,10 @@ class YouTubeClient(QMainWindow):
         self.prev_page_button.setVisible(False)
         self.prev_page_button.clicked.connect(self.prev_page)
         self.left_layout.addWidget(self.prev_page_button)
+
+        self.dark_mode_button = QPushButton('Toggle Dark Mode', self)
+        self.dark_mode_button.clicked.connect(self.toggle_dark_mode)
+        self.left_layout.addWidget(self.dark_mode_button)
 
         self.tray_icon = QSystemTrayIcon(QIcon("icon.png"), self)
         self.tray_icon.show()
@@ -82,6 +93,32 @@ class YouTubeClient(QMainWindow):
         self.current_page = 1
         self.next_page_token = None
         self.prev_page_token = None
+
+        self.playlist = []
+
+        # Media Controls
+        self.media_controls_layout = QHBoxLayout()
+        self.play_pause_button = QPushButton('Play/Pause', self)
+        self.play_pause_button.clicked.connect(self.play_pause_video)
+        self.media_controls_layout.addWidget(self.play_pause_button)
+
+        self.fullscreen_button = QPushButton('Fullscreen', self)
+        self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
+        self.media_controls_layout.addWidget(self.fullscreen_button)
+
+        self.fast_forward_button = QPushButton('Fast Forward', self)
+        self.fast_forward_button.clicked.connect(self.fast_forward_video)
+        self.media_controls_layout.addWidget(self.fast_forward_button)
+
+        self.pip_button = QPushButton('Picture in Picture', self)
+        self.pip_button.clicked.connect(self.toggle_picture_in_picture)
+        self.media_controls_layout.addWidget(self.pip_button)
+
+        self.right_layout.addLayout(self.media_controls_layout)
+
+        self.is_fullscreen = False
+        self.fullscreen_process = None
+        self.current_video_url = None
 
     def init_menu(self):
         menubar = self.menuBar()
@@ -152,6 +189,7 @@ class YouTubeClient(QMainWindow):
             item_layout.addWidget(thumbnail_label)
 
             title_label = QLabel(f"{video['title']} ({video['videoId']})")
+            title_label.setWordWrap(True)
             item_layout.addWidget(title_label)
 
             item_widget.setLayout(item_layout)
@@ -177,8 +215,10 @@ class YouTubeClient(QMainWindow):
         self.console_output.append(f"Author: {video['author']}")
 
         self.current_video = video
+        self.current_video_url = f"https://www.youtube.com/watch?v={video['videoId']}"
         self.quality_combo.setVisible(True)
         self.watch_button.setVisible(True)
+        self.show_comments_button.setVisible(True)
 
     def format_duration(self, duration):
         minutes, seconds = divmod(duration, 60)
@@ -188,22 +228,51 @@ class YouTubeClient(QMainWindow):
     def update_console(self, text):
         self.console_output.append(text)
 
+    def get_quality_option(self):
+        quality = self.quality_combo.currentText()
+        quality_map = {
+            'Best': 'best',
+            '1080p': 'bestvideo[height<=1080]+bestaudio/best',
+            '720p': 'bestvideo[height<=720]+bestaudio/best',
+            '480p': 'bestvideo[height<=480]+bestaudio/best',
+            '360p': 'bestvideo[height<=360]+bestaudio/best'
+        }
+        return quality_map.get(quality, 'best')
+
     def watch_video(self):
         if not self.current_video:
             QMessageBox.warning(self, 'Error', 'No video selected.')
             return
 
-        video_id = self.current_video['videoId']
-        video_url = f"https://www.youtube.com/watch?v={video_id}"
-        self.console_output.append(f"Playing video: {video_url}")
-        self.play_video_with_mpv(video_url)
+        self.console_output.append(f"Playing video: {self.current_video_url}")
+        self.play_video_with_mpv(self.current_video_url)
 
     def play_video_with_mpv(self, url):
         if self.mpv_process:
             self.mpv_process.terminate()
             self.mpv_process.waitForFinished()
-        command = ['mpv', f'--wid={int(self.mpv_widget.winId())}', '--no-cache', '--no-osc', '--force-window=immediate', '--geometry=100%x100%', url]
+
+        input_conf_path = os.path.join(os.path.dirname(__file__), 'input.conf')
+        if not os.path.exists(input_conf_path):
+            self.console_output.append(f"Error: input.conf file not found at {input_conf_path}")
+            return
+
+        quality_option = self.get_quality_option()
+
+        command = [
+            'mpv',
+            f'--wid={int(self.mpv_widget.winId())}',
+            '--no-cache',
+            '--osc',
+            '--force-window=immediate',
+            '--geometry=100%x100%',
+            url,
+            f'--ytdl-format={quality_option}',
+            f'--input-conf={input_conf_path}'
+        ]
+        
         self.console_output.append(f"MPV command: {' '.join(command)}")
+
         self.mpv_process = QProcess(self)
         self.mpv_process.start(command[0], command[1:])
         self.mpv_process.readyReadStandardOutput.connect(self.handle_mpv_output)
@@ -213,9 +282,151 @@ class YouTubeClient(QMainWindow):
         output = self.mpv_process.readAllStandardOutput().data().decode()
         error_output = self.mpv_process.readAllStandardError().data().decode()
         if output:
-            self.console_output.append(output)
+            self.console_output.append(f"MPV Output: {output}")
         if error_output:
-            self.console_output.append(error_output)
+            self.console_output.append(f"MPV Error: {error_output}")
+        if "Exiting... (Quit)" in error_output and self.is_fullscreen:
+            self.is_fullscreen = False
+            self.console_output.append("Fullscreen exited, reattaching MPV player.")
+            self.play_video_with_mpv(self.current_video_url)
+
+    def toggle_dark_mode(self):
+        palette = QPalette()
+        if self.dark_mode_button.text() == "Toggle Dark Mode":
+            palette.setColor(QPalette.Window, QColor(53, 53, 53))
+            palette.setColor(QPalette.WindowText, Qt.white)
+            palette.setColor(QPalette.Base, QColor(25, 25, 25))
+            palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+            palette.setColor(QPalette.ToolTipBase, Qt.white)
+            palette.setColor(QPalette.ToolTipText, Qt.white)
+            palette.setColor(QPalette.Text, Qt.white)
+            palette.setColor(QPalette.Button, QColor(53, 53, 53))
+            palette.setColor(QPalette.ButtonText, Qt.white)
+            palette.setColor(QPalette.BrightText, Qt.red)
+            palette.setColor(QPalette.Link, QColor(42, 130, 218))
+            palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+            palette.setColor(QPalette.HighlightedText, Qt.black)
+            self.dark_mode_button.setText("Toggle Light Mode")
+        else:
+            palette = QApplication.style().standardPalette()
+            self.dark_mode_button.setText("Toggle Dark Mode")
+
+        QApplication.setPalette(palette)
+
+    def play_pause_video(self):
+        if self.mpv_process:
+            self.mpv_process.write(b'cycle pause\n')
+
+    def toggle_fullscreen(self):
+        if not self.is_fullscreen:
+            self.console_output.append('Detaching MPV player for fullscreen')
+            self.is_fullscreen = True
+            self.mpv_process.terminate()
+            self.mpv_process.waitForFinished()
+            quality_option = self.get_quality_option()
+            command = [
+                'mpv',
+                self.current_video_url,
+                '--fullscreen',
+                '--no-cache',
+                '--osc',
+                '--geometry=100%x100%',
+                f'--ytdl-format={quality_option}',
+                '--input-conf=input.conf'
+            ]
+            self.console_output.append(f"MPV fullscreen command: {' '.join(command)}")
+            self.fullscreen_process = QProcess(self)
+            self.fullscreen_process.start(command[0], command[1:])
+            self.fullscreen_process.finished.connect(self.on_fullscreen_exit)
+        else:
+            self.console_output.append('Fullscreen already active')
+
+    def on_fullscreen_exit(self):
+        self.is_fullscreen = False
+        self.console_output.append('Fullscreen exited, reattaching MPV player')
+        self.play_video_with_mpv(self.current_video_url)
+
+    def fast_forward_video(self):
+        if self.mpv_process:
+            self.mpv_process.write(b'seek 10\n')
+
+    def toggle_picture_in_picture(self):
+        if self.mpv_process:
+            self.mpv_process.terminate()
+            self.mpv_process.waitForFinished()
+
+        quality_option = self.get_quality_option()
+        command = [
+            'mpv',
+            '--no-cache',
+            '--osc',
+            '--force-window=immediate',
+            '--geometry=20%x20%+80%+80%',
+            '--ontop',
+            '--autofit=640x360',
+            self.current_video_url,
+            f'--ytdl-format={quality_option}'
+        ]
+
+        self.console_output.append(f"MPV PiP command: {' '.join(command)}")
+
+        self.mpv_process = QProcess(self)
+        self.mpv_process.start(command[0], command[1:])
+        self.mpv_process.readyReadStandardOutput.connect(self.handle_mpv_output)
+        self.mpv_process.readyReadStandardError.connect(self.handle_mpv_output)
+
+    def show_comments(self):
+        if not self.current_video:
+            QMessageBox.warning(self, 'Error', 'No video selected.')
+            return
+
+        self.video_id = self.current_video['videoId']
+        self.comments_offset = 0
+
+        self.comments_dialog = QDialog(self)
+        self.comments_dialog.setWindowTitle("Comments")
+        self.comments_layout = QVBoxLayout()
+        self.comments_scroll_area = QScrollArea()
+        self.comments_widget = QWidget()
+        self.comments_widget_layout = QVBoxLayout()
+        self.comments_widget.setLayout(self.comments_widget_layout)
+        self.comments_scroll_area.setWidget(self.comments_widget)
+        self.comments_scroll_area.setWidgetResizable(True)
+        self.comments_layout.addWidget(self.comments_scroll_area)
+
+        self.show_more_button = QPushButton("Show More Comments")
+        self.show_more_button.clicked.connect(self.load_more_comments)
+        self.comments_layout.addWidget(self.show_more_button)
+        
+        self.comments_dialog.setLayout(self.comments_layout)
+
+        self.load_more_comments()
+        self.comments_dialog.exec_()
+
+    def load_more_comments(self):
+        self.comments_thread = CommentsThread(self.video_id, offset=self.comments_offset, limit=10)
+        self.comments_thread.comments_fetched.connect(self.display_comments)
+        self.comments_thread.start()
+
+    def display_comments(self, comments):
+        for comment in comments:
+            comment_layout = QHBoxLayout()
+            profile_pic_label = QLabel()
+            if comment['profile_pic']:
+                profile_pic = QPixmap()
+                profile_pic.loadFromData(requests.get(comment['profile_pic']).content)
+                profile_pic_label.setPixmap(profile_pic.scaled(40, 40, Qt.KeepAspectRatio))
+            else:
+                profile_pic_label.setText("No Profile Pic")
+            comment_layout.addWidget(profile_pic_label)
+
+            comment_text = QLabel(f"{comment['username']}: {comment['text']}")
+            comment_text.setWordWrap(True)
+            comment_layout.addWidget(comment_text)
+
+            self.comments_widget_layout.addLayout(comment_layout)
+
+        self.comments_offset += 10
 
 class SearchThread(QThread):
     search_finished = pyqtSignal(list, str, str)
@@ -283,6 +494,73 @@ class SearchThread(QThread):
         elif len(parts) == 3:  # HH:MM:SS
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
         return 0
+
+class CommentsThread(QThread):
+    comments_fetched = pyqtSignal(list)
+
+    def __init__(self, video_id, offset=0, limit=10):
+        super().__init__()
+        self.video_id = video_id
+        self.offset = offset
+        self.limit = limit
+
+    def run(self):
+        invidious_instances = [
+            "https://yewtu.be",
+            "https://vid.puffyan.us",
+            "https://invidious.flokinet.to",
+            "https://invidious.projectsegfau.lt",
+            "https://inv.bp.projectsegfau.lt",
+            "https://inv.in.projectsegfau.lt",
+            "https://invidious.tiekoetter.com",
+            "https://invidious.slipfox.xyz",
+            "https://invidious.privacydev.net",
+            "https://vid.priv.au",
+            "https://iv.ggtyler.dev",
+            "https://invidious.0011.lt",
+            "https://inv.zzls.xyz",
+            "https://invidious.protokolla.fi"
+        ]
+
+        comments = []
+
+        def fetch_comments(instance):
+            url = f"{instance}/api/v1/comments/{self.video_id}?offset={self.offset}&limit={self.limit}"
+            try:
+                response = requests.get(url)
+                if response.status_code == 200 and response.content.strip() and 'html' not in response.headers.get('Content-Type', ''):
+                    json_data = response.json()
+                    instance_comments = []
+                    for item in json_data:
+                        username = item.get('author', 'Unknown')
+                        text = item.get('content', '')
+                        profile_pic_url = item['authorThumbnails'][0]['url'] if 'authorThumbnails' in item and item['authorThumbnails'] else ''
+                        instance_comments.append({
+                            'username': username,
+                            'text': text,
+                            'profile_pic': profile_pic_url
+                        })
+                    return instance_comments
+                else:
+                    print(f"Instance {instance} returned an empty response or HTML content.")
+            except (json.JSONDecodeError, KeyError, AttributeError) as e:
+                print(f"Error parsing Invidious comments from instance {instance}: {str(e)}")
+                print(f"Response content: {response.content}")
+            except SSLError as ssl_err:
+                print(f"SSL error with instance {instance}: {ssl_err}")
+            except RequestException as req_err:
+                print(f"Request error with instance {instance}: {req_err}")
+            return []
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_instance = {executor.submit(fetch_comments, instance): instance for instance in invidious_instances}
+            for future in concurrent.futures.as_completed(future_to_instance):
+                instance_comments = future.result()
+                if instance_comments:
+                    comments.extend(instance_comments)
+                    break  # Stop after successfully retrieving comments from one instance
+
+        self.comments_fetched.emit(comments)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

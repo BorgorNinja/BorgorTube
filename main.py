@@ -3,18 +3,67 @@ import os
 import re
 import json
 import requests
+import asyncio
+from pyppeteer import launch
+import yt_dlp
 from PyQt5.QtCore import QProcess, Qt
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton,
                              QLineEdit, QTextEdit, QLabel, QProgressBar, QComboBox,
-                             QHBoxLayout, QListWidget, QListWidgetItem, QFileDialog, QMessageBox)
+                             QHBoxLayout, QListWidget, QListWidgetItem)
 from PyQt5.QtGui import QPixmap, QPalette, QColor
 from bs4 import BeautifulSoup
 import aiohttp
-import asyncio
 import platform
 
 # Define the path for the settings file
 SETTINGS_FILE = "settings.json"
+
+##############################
+# Fallback functions for cookies extraction using pyppeteer and yt-dlp
+
+async def get_cookies_headless(video_url):
+    """Launch headless Chromium to fetch cookies from the given URL."""
+    print("Launching headless Chromium for cookie extraction...")
+    browser = await launch(headless=True, args=['--no-sandbox'])
+    page = await browser.newPage()
+    await page.goto(video_url, {'waitUntil': 'networkidle2'})
+    # Allow some time for JavaScript to run
+    await asyncio.sleep(5)
+    cookies = await page.cookies()
+    await browser.close()
+    return cookies
+
+def save_cookies_to_file(cookies, filename="cookies.txt"):
+    """Save cookies in Netscape cookie file format."""
+    with open(filename, "w") as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        for cookie in cookies:
+            domain = cookie.get("domain", "")
+            flag = "TRUE" if domain.startswith(".") else "FALSE"
+            path = cookie.get("path", "/")
+            secure = "TRUE" if cookie.get("secure", False) else "FALSE"
+            expiry = str(cookie.get("expires", 0))
+            name = cookie.get("name", "")
+            value = cookie.get("value", "")
+            f.write("\t".join([domain, flag, path, secure, expiry, name, value]) + "\n")
+    print("Cookies saved to", filename)
+    return filename
+
+def extract_video_info(video_url, cookies_file=None):
+    """Attempt to extract video information using yt-dlp."""
+    opts = {
+        'quiet': True,
+        'skip_download': True,
+        'format': 'best'
+    }
+    if cookies_file:
+        opts['cookies'] = cookies_file
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+        return info
+
+##############################
+# YouTube Client with integrated fallback for mpv playback
 
 class YouTubeClient(QMainWindow):
     def __init__(self):
@@ -75,19 +124,22 @@ class YouTubeClient(QMainWindow):
         self.dark_mode_button.clicked.connect(self.toggle_dark_mode)
         self.left_layout.addWidget(self.dark_mode_button)
 
-        # Attach/Detach Button
+        # Detach/Attach Button
         self.attach_detach_button = QPushButton('Detach Video', self)
         self.attach_detach_button.clicked.connect(self.toggle_attach_detach)
         self.left_layout.addWidget(self.attach_detach_button)
 
-        # Embed MPV player
+        # Create an mpv_widget and force it to be a native window
         self.mpv_widget = QWidget(self)
+        # These attributes help ensure we get a real X11 window ID (on X11).
+        self.mpv_widget.setAttribute(Qt.WA_DontCreateNativeAncestors, True)
+        self.mpv_widget.setAttribute(Qt.WA_NativeWindow, True)
+        # Set a minimum size so it's visible
+        self.mpv_widget.setMinimumSize(640, 360)
         self.right_layout.addWidget(self.mpv_widget)
-        self.mpv_widget.setMouseTracking(True)
-        self.mpv_widget.mouseMoveEvent = self.show_mpv_controls
-        self.mpv_process = None
+        self.mpv_widget.show()
 
-        # Media Controls
+        # Media Controls – placeholders
         self.media_controls_layout = QHBoxLayout()
         self.play_pause_button = QPushButton('Play/Pause', self)
         self.play_pause_button.clicked.connect(self.play_pause_video)
@@ -103,12 +155,11 @@ class YouTubeClient(QMainWindow):
 
         self.right_layout.addLayout(self.media_controls_layout)
 
-        self.is_fullscreen = False
-        self.fullscreen_process = None
-
-        # Playlist and current video URL
+        # Variables to track playback and playlist
+        self.player_process = None
         self.playlist = []
         self.current_video_url = None
+        self.is_detached = False  # Track whether mpv is detached or embedded
 
         # Load persistent settings (quality)
         self.load_quality_settings()
@@ -198,36 +249,42 @@ class YouTubeClient(QMainWindow):
         self.watch_button.setVisible(True)
 
     def toggle_attach_detach(self):
-        if self.mpv_process:
-            if self.is_fullscreen:
-                self.is_fullscreen = False
-                self.console_output.append("Exiting fullscreen and detaching MPV player.")
-                self.mpv_process.terminate()
-                self.mpv_process.waitForFinished()
+        """
+        Toggle between embedded and detached mpv playback.
+        """
+        if not self.current_video_url:
+            self.console_output.append("No video is selected to attach/detach.")
+            return
 
-            # Detach the video
-            self.mpv_process.write(b'set pause false\n')  # Resume the video if it was paused
-            self.console_output.append("Video detached to a new window.")
-            self.attach_detach_button.setText("Attach Video")
-            
-            command = [
-                'mpv',
-                '--no-cache',
-                '--osc',
-                self.current_video_url,
-                f'--ytdl-format={self.get_quality_option()}',
-                '--input-ipc-server=/tmp/mpvsocket'
-            ]
-            
-            # Start a new MPV process for detached playback
-            self.fullscreen_process = QProcess(self)
-            self.fullscreen_process.start(command[0], command[1:])
+        # Kill any existing mpv process first
+        self.kill_mpv()
 
-        else:
-            # Reattach the video to the PyQt window
-            self.console_output.append("Reattaching video to the PyQt window.")
+        if self.is_detached:
+            # Currently detached; switch to embedded
+            self.is_detached = False
             self.attach_detach_button.setText("Detach Video")
-            self.start_mpv_player()  # Start the player again embedded in the window
+            self.console_output.append("Re-attaching video to the embedded mpv widget...")
+            self.start_player(embedded=True)
+        else:
+            # Currently embedded; switch to detached
+            self.is_detached = True
+            self.attach_detach_button.setText("Attach Video")
+            self.console_output.append("Detaching video to a new mpv window...")
+            self.start_player(embedded=False)
+
+    def kill_mpv(self):
+        """
+        Kill any existing mpv process. 
+        """
+        os_type = platform.system()
+        if os_type == "Windows":
+            os.system("taskkill /F /IM mpv.exe")
+        elif os_type == "Linux":
+            os.system("pkill mpv")
+        elif os_type == "Darwin":
+            os.system("pkill mpv")
+        else:
+            self.console_output.append('Unsupported Operating System')
 
     def watch_video(self):
         current_item = self.video_list.currentItem()
@@ -236,35 +293,69 @@ class YouTubeClient(QMainWindow):
             self.current_video_url = f"https://www.youtube.com/watch?v={video_data['videoId']}"
             self.console_output.append(f'Watching video: {video_data["title"]}')
 
-            # Kill all existing MPV instances before starting a new one
-            os_type = platform.system()  # Command to kill all running MPV instances
-            if os_type == "Windows":
-                os.system("taskkill /F /IM mpv.exe")
-            elif os_type == "Linux":
-                os.system("pkill mpv")
-            elif os_type == "Darwin":
-                os.system("pkilk mpv")
-            else:
-                self.console_output.append('Unsupported Operating System')
-            self.start_mpv_player()
+            self.kill_mpv()
+            # By default, use embedded mode if user hasn't toggled detach yet
+            self.start_player(embedded=not self.is_detached)
 
-    def start_mpv_player(self):
-        # Get the handle of the mpv_widget for embedding
-        wid = str(int(self.mpv_widget.winId()))
+    def prepare_playback(self):
+        """
+        Try to extract video info using yt-dlp. If that fails, use headless Chromium to extract cookies.
+        Returns the path to the cookies file if cookies were needed; otherwise, returns None.
+        """
+        try:
+            self.console_output.append("Attempting initial video extraction without cookies...")
+            extract_video_info(self.current_video_url, cookies_file=None)
+            self.console_output.append("Extraction succeeded without cookies.")
+            return None
+        except Exception as e:
+            self.console_output.append("Initial extraction failed: " + str(e))
+            self.console_output.append("Attempting headless cookie extraction fallback...")
+            try:
+                cookies = asyncio.get_event_loop().run_until_complete(get_cookies_headless(self.current_video_url))
+            except Exception as e2:
+                self.console_output.append("Headless cookie extraction failed: " + str(e2))
+                return None
+            cookies_file = save_cookies_to_file(cookies, "cookies.txt")
+            self.console_output.append("Cookies extracted and saved.")
+            try:
+                extract_video_info(self.current_video_url, cookies_file=cookies_file)
+                self.console_output.append("Extraction succeeded with fallback cookies.")
+                return cookies_file
+            except Exception as e3:
+                self.console_output.append("Fallback extraction failed: " + str(e3))
+                return None
 
-        command = [
-            'mpv',
-            '--no-cache',
+    def start_player(self, embedded=True):
+        """
+        Start mpv playback. If embedded=True, mpv is embedded in self.mpv_widget.
+        Otherwise, mpv spawns a detached window.
+        """
+        # Prepare playback by attempting extraction (and cookie fallback if needed)
+        cookies_file = self.prepare_playback()
+
+        # Common mpv options to (hopefully) improve audio
+        # and general playback quality:
+        mpv_opts = [
             '--osc',
-            f'--wid={wid}',  # Embed in this widget
-            self.current_video_url,
+            '--cache=yes',
+            '--demuxer-thread=yes',
             f'--ytdl-format={self.get_quality_option()}',
-            '--input-ipc-server=/tmp/mpvsocket'
+            '--input-ipc-server=/tmp/mpvsocket',
+            self.current_video_url
         ]
+        if cookies_file:
+            mpv_opts.append(f'--ytdl-raw-options=cookies={cookies_file}')
 
-        self.mpv_process = QProcess(self)
-        self.mpv_process.start(command[0], command[1:])
-        self.console_output.append('MPV player started.')
+        if embedded:
+            # Embed mpv in the mpv_widget
+            wid = str(int(self.mpv_widget.winId()))
+            mpv_opts.insert(0, f'--wid={wid}')
+            self.console_output.append('Playback started with mpv (embedded).')
+        else:
+            self.console_output.append('Playback started with mpv (detached).')
+
+        self.player_process = QProcess(self)
+        self.player_process.start("mpv", mpv_opts)
 
     def parse_duration(self, duration_text):
         """ Convert duration text to seconds """
@@ -309,7 +400,8 @@ class YouTubeClient(QMainWindow):
 
         for video in self.playlist:
             self.current_video_url = video
-            self.start_mpv_player()
+            self.kill_mpv()
+            self.start_player(embedded=not self.is_detached)
             self.console_output.append(f'Playing video from playlist: {video}')
 
     def toggle_dark_mode(self):
@@ -328,27 +420,13 @@ class YouTubeClient(QMainWindow):
         self.setPalette(palette)
 
     def play_pause_video(self):
-        if self.mpv_process:
-            self.mpv_process.write(b'set pause toggle\n')
+        self.console_output.append("Play/Pause control is not wired for mpv embedding (use mpv keybindings).")
 
     def toggle_fullscreen(self):
-        if self.mpv_process:
-            if self.is_fullscreen:
-                self.mpv_process.write(b'quit\n')
-                self.is_fullscreen = False
-                self.console_output.append("Exited fullscreen.")
-            else:
-                self.mpv_process.write(b'fullscreen\n')
-                self.is_fullscreen = True
-                self.console_output.append("Entered fullscreen.")
+        self.console_output.append("Fullscreen control is not wired for mpv embedding (use mpv keybindings).")
 
     def fast_forward_video(self):
-        if self.mpv_process:
-            self.mpv_process.write(b'set speed 2.0\n')
-
-    def show_mpv_controls(self, event):
-        if self.mpv_process:
-            self.mpv_process.write(b'osc\n')
+        self.console_output.append("Fast forward control is not wired for mpv embedding (use mpv keybindings).")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

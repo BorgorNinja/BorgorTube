@@ -8,21 +8,26 @@ from pyppeteer import launch
 import yt_dlp
 
 from PyQt5.QtCore import (
-    QProcess, Qt, QThreadPool, QRunnable, pyqtSlot, QObject, pyqtSignal, QSize, QTimer
+    QProcess, Qt, QThreadPool, QRunnable, pyqtSlot, QObject, pyqtSignal,
+    QSize, QTimer
 )
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QListWidget,
-    QListWidgetItem, QPushButton, QLineEdit, QComboBox, QTextEdit, QProgressBar
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QScrollArea, QGridLayout, QLineEdit, QPushButton, QLabel, QTextEdit,
+    QComboBox, QListWidget, QListWidgetItem, QStackedWidget, QSpacerItem,
+    QSizePolicy
 )
-from PyQt5.QtGui import QPixmap, QIcon, QPalette, QColor
+from PyQt5.QtGui import QPixmap, QIcon, QPalette, QColor, QFont
 
 #################################
-# Fixed Chromium 132 User Agent
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+# Hard-coded user agent (Chromium 132)
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+)
 
 #################################
-# Bucket Labels and Format Mapping
-# These strings force mpv to merge video and audio streams at or above a minimum resolution.
+# Format mapping for merged playback
 FORMAT_MAPPING = {
     "2k":       "bestvideo[height>=1440]+bestaudio/best",
     "1080p60":  "bestvideo[height>=1080][fps>=60]+bestaudio/best",
@@ -33,63 +38,50 @@ FORMAT_MAPPING = {
     "240p":     "bestvideo[height>=240][height<360]+bestaudio/best",
     "144p":     "bestvideo[height>=144][height<240]+bestaudio/best",
 }
-BUCKET_LABELS = [
-    "2k",
-    "1080p60",
-    "1080p",
-    "720p60",
-    "720p",
-    "360p",
-    "240p",
-    "144p"
-]
+ALL_QUALITIES = list(FORMAT_MAPPING.keys())
 
 SETTINGS_FILE = "settings.json"
 LOG_FILE = "mpvlog.txt"
 
 #################################
-# available_buckets function
+# Check which “buckets” are available
 def available_buckets(info):
-    """
-    Given the yt-dlp info dict, return a list of bucket labels that are available.
-    Unlike before, we do not filter out video-only streams.
-    We simply check if any format (combined or video-only) meets the criteria.
-    """
     formats = info.get("formats", [])
-    bucket_avail = {}
+    bucket_avail = set()
     for f in formats:
         h = f.get("height") or 0
         fps = f.get("fps") or 0
-        # We ignore tbr here and just check resolution (and fps for certain buckets).
-        for label in BUCKET_LABELS:
-            if label == "2k" and h >= 1440:
-                bucket_avail[label] = True
-            elif label == "1080p60" and h >= 1080 and fps >= 60:
-                bucket_avail[label] = True
-            elif label == "1080p" and h >= 1080:
-                bucket_avail[label] = True
-            elif label == "720p60" and h >= 720 and fps >= 60:
-                bucket_avail[label] = True
-            elif label == "720p" and h >= 720 and h < 1080:
-                bucket_avail[label] = True
-            elif label == "360p" and h >= 360 and h < 720:
-                bucket_avail[label] = True
-            elif label == "240p" and h >= 240 and h < 360:
-                bucket_avail[label] = True
-            elif label == "144p" and h >= 144 and h < 240:
-                bucket_avail[label] = True
-    # Return available buckets in the order defined in BUCKET_LABELS.
-    return [label for label in BUCKET_LABELS if label in bucket_avail]
+        if h >= 1440:
+            bucket_avail.add("2k")
+        if h >= 1080 and fps >= 60:
+            bucket_avail.add("1080p60")
+        if h >= 1080:
+            bucket_avail.add("1080p")
+        if h >= 720 and fps >= 60:
+            bucket_avail.add("720p60")
+        if h >= 720 and h < 1080:
+            bucket_avail.add("720p")
+        if h >= 360 and h < 720:
+            bucket_avail.add("360p")
+        if h >= 240 and h < 360:
+            bucket_avail.add("240p")
+        if h >= 144 and h < 240:
+            bucket_avail.add("144p")
+    # Return in descending order as in ALL_QUALITIES
+    result = []
+    for q in ALL_QUALITIES:
+        if q in bucket_avail:
+            result.append(q)
+    return result
 
 #################################
-# Cookie Fallback Functions
-
+# Cookie fallback for restricted videos
 async def get_cookies_headless(video_url):
     print("Launching headless Chromium for cookie extraction...")
-    browser = await launch(headless=True, args=['--no-sandbox'])
+    browser = await launch(headless=True, args=["--no-sandbox"])
     page = await browser.newPage()
     await page.setUserAgent(USER_AGENT)
-    await page.goto(video_url, {'waitUntil': 'networkidle2'})
+    await page.goto(video_url, {"waitUntil": "networkidle2"})
     await asyncio.sleep(3)
     cookies = await page.cookies()
     await browser.close()
@@ -106,13 +98,14 @@ def save_cookies_to_file(cookies, filename="cookies.txt"):
             expiry = str(c.get("expires", 0))
             name = c.get("name", "")
             value = c.get("value", "")
-            f.write("\t".join([domain, flag, path, secure, expiry, name, value]) + "\n")
+            f.write("\t".join([
+                domain, flag, path, secure, expiry, name, value
+            ]) + "\n")
     print("Cookies saved to", filename)
     return filename
 
 #################################
-# Searching and Extraction
-
+# Searching & extraction
 def search_youtube(query, max_results=20):
     expr = f"ytsearch{max_results}:{query}"
     opts = {
@@ -151,8 +144,7 @@ def extract_formats(video_url, cookies_file=None):
         return info
 
 #################################
-# Asynchronous Worker
-
+# Thread worker
 class WorkerSignals(QObject):
     finished = pyqtSignal(object)
 
@@ -163,6 +155,7 @@ class Worker(QRunnable):
         self.args = args
         self.kwargs = kwargs
         self.signals = WorkerSignals()
+
     @pyqtSlot()
     def run(self):
         try:
@@ -172,195 +165,250 @@ class Worker(QRunnable):
             self.signals.finished.emit(e)
 
 #################################
-# Main Application Window
-
-class YouTubeClient(QMainWindow):
+# Main Window
+class ModernYouTubeClient(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("YouTube Client")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("BorgorTube")
+        self.resize(1280, 800)
+
         self.threadpool = QThreadPool()
-        self.central_widget = QWidget()
-        self.setCentralWidget(self.central_widget)
-        self.main_layout = QHBoxLayout(self.central_widget)
-
-        # Left layout
-        self.left_layout = QVBoxLayout()
-        self.main_layout.addLayout(self.left_layout, 2)
-
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Search YouTube")
-        self.left_layout.addWidget(self.url_input)
-
-        self.search_button = QPushButton("Search")
-        self.search_button.clicked.connect(self.start_search)
-        self.left_layout.addWidget(self.search_button)
-
-        self.video_list = QListWidget()
-        self.video_list.setIconSize(QSize(320, 180))
-        self.video_list.itemClicked.connect(self.on_video_clicked)
-        self.left_layout.addWidget(self.video_list)
-
-        self.console_output = QTextEdit()
-        self.console_output.setReadOnly(True)
-        self.left_layout.addWidget(self.console_output)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.left_layout.addWidget(self.progress_bar)
-
-        # Quality selector (populated dynamically)
-        self.quality_combo = QComboBox()
-        self.left_layout.addWidget(self.quality_combo)
-
-        self.watch_button = QPushButton("Watch")
-        self.watch_button.setVisible(False)
-        self.watch_button.clicked.connect(self.watch_video)
-        self.left_layout.addWidget(self.watch_button)
-
-        # Button for separate streams mode
-        self.watch_separate_button = QPushButton("Watch Separate Streams")
-        self.watch_separate_button.setVisible(False)
-        self.watch_separate_button.clicked.connect(self.watch_separate_streams)
-        self.left_layout.addWidget(self.watch_separate_button)
-
-        self.add_to_playlist_button = QPushButton("Add to Playlist")
-        self.add_to_playlist_button.clicked.connect(self.add_to_playlist)
-        self.left_layout.addWidget(self.add_to_playlist_button)
-
-        self.play_playlist_button = QPushButton("Play Playlist")
-        self.play_playlist_button.clicked.connect(self.play_playlist)
-        self.left_layout.addWidget(self.play_playlist_button)
-
-        self.dark_mode_button = QPushButton("Toggle Dark Mode")
-        self.dark_mode_button.clicked.connect(self.toggle_dark_mode)
-        self.left_layout.addWidget(self.dark_mode_button)
-
-        self.attach_detach_button = QPushButton("Detach Video")
-        self.attach_detach_button.clicked.connect(self.toggle_attach_detach)
-        self.left_layout.addWidget(self.attach_detach_button)
-
-        # Right layout
-        self.right_layout = QVBoxLayout()
-        self.main_layout.addLayout(self.right_layout, 3)
-
-        self.mpv_widget = QWidget()
-        self.mpv_widget.setAttribute(Qt.WA_DontCreateNativeAncestors, True)
-        self.mpv_widget.setAttribute(Qt.WA_NativeWindow, True)
-        self.mpv_widget.setMinimumSize(640, 360)
-        self.right_layout.addWidget(self.mpv_widget)
-
-        self.media_controls_layout = QHBoxLayout()
-        self.play_pause_button = QPushButton("Play/Pause")
-        self.play_pause_button.clicked.connect(self.play_pause_video)
-        self.media_controls_layout.addWidget(self.play_pause_button)
-
-        self.fullscreen_button = QPushButton("Fullscreen")
-        self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
-        self.media_controls_layout.addWidget(self.fullscreen_button)
-
-        self.fast_forward_button = QPushButton("Fast Forward")
-        self.fast_forward_button.clicked.connect(self.fast_forward_video)
-        self.media_controls_layout.addWidget(self.fast_forward_button)
-
-        self.right_layout.addLayout(self.media_controls_layout)
-
-        # Internal state
-        self.search_results = []
-        self.cookies_file = None
+        self.current_info = None
         self.current_video_url = None
-        self.current_info = None  # full info from yt-dlp
-        self.bucketed_formats = []  # list of available bucket labels
+        self.qualities_available = []
         self.player_process = None
-        self.video_process = None
-        self.audio_process = None
         self.is_detached = False
         self.playlist = []
+        self.video_process = None
+        self.audio_process = None
 
-        self.url_input.returnPressed.connect(self.search_button.click)
-        self.load_quality_settings()
-
-        # Timer for synchronizing separate streams (stub)
+        # Timer for sync (separate streams)
         self.sync_timer = QTimer()
         self.sync_timer.timeout.connect(self.check_sync)
 
-    def load_quality_settings(self):
-        if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, "r") as f:
-                pass
+        # Build UI
+        self.build_ui()
 
-    def save_quality_settings(self):
-        pass
+    def build_ui(self):
+        # Main vertical container
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_vlayout = QVBoxLayout(central_widget)
+        main_vlayout.setContentsMargins(0,0,0,0)
+        main_vlayout.setSpacing(0)
 
-    ############################
-    # Searching
+        # 1) Top bar
+        self.top_bar = self.create_top_bar()
+        main_vlayout.addWidget(self.top_bar, 0)
 
-    def start_search(self):
-        query = self.url_input.text().strip()
+        # 2) Stacked widget for pages
+        self.stacked_widget = QStackedWidget()
+        self.home_page = self.create_home_page()
+        self.playback_page = self.create_playback_page()
+        self.stacked_widget.addWidget(self.home_page)     # index 0
+        self.stacked_widget.addWidget(self.playback_page) # index 1
+
+        main_vlayout.addWidget(self.stacked_widget, 1)
+
+        # 3) Console output at bottom
+        self.console_output = QTextEdit()
+        self.console_output.setReadOnly(True)
+        self.console_output.setFixedHeight(150)
+        main_vlayout.addWidget(self.console_output)
+
+        self.stacked_widget.setCurrentIndex(0)
+
+    # ------------------
+    # Top bar
+    def create_top_bar(self):
+        top_widget = QWidget()
+        layout = QHBoxLayout(top_widget)
+        layout.setContentsMargins(10,5,10,5)
+
+        # Search field
+        self.search_field = QLineEdit()
+        self.search_field.setPlaceholderText("Search or paste YouTube URL")
+        self.search_field.returnPressed.connect(self.do_search)
+        layout.addWidget(self.search_field)
+
+        # Search button
+        self.search_button = QPushButton("Search")
+        self.search_button.clicked.connect(self.do_search)
+        layout.addWidget(self.search_button)
+
+        # Quality combo
+        self.quality_combo = QComboBox()
+        # We'll fill it dynamically once we know what's available
+        # But let's default to "360p" if none
+        self.quality_combo.addItem("360p")
+        layout.addWidget(self.quality_combo)
+
+        # Detach
+        self.detach_button = QPushButton("Detach")
+        self.detach_button.clicked.connect(self.toggle_detach)
+        layout.addWidget(self.detach_button)
+
+        # Fullscreen
+        self.fullscreen_button = QPushButton("Fullscreen")
+        self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
+        layout.addWidget(self.fullscreen_button)
+
+        # Dark Mode
+        self.dark_button = QPushButton("Dark Mode")
+        self.dark_button.clicked.connect(self.toggle_dark_mode)
+        layout.addWidget(self.dark_button)
+
+        return top_widget
+
+    # ------------------
+    # Home page
+    def create_home_page(self):
+        page = QWidget()
+        vlayout = QVBoxLayout(page)
+        vlayout.setContentsMargins(5,5,5,5)
+
+        # Label
+        self.home_label = QLabel("Search Results")
+        self.home_label.setStyleSheet("font-size: 18px; font-weight: bold;")
+        vlayout.addWidget(self.home_label, 0, Qt.AlignTop)
+
+        # Scrollable area with grid
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setSpacing(10)
+        self.grid_layout.setContentsMargins(10,10,10,10)
+        self.scroll_area.setWidget(self.grid_container)
+
+        vlayout.addWidget(self.scroll_area, 1)
+        return page
+
+    def populate_home_grid(self, results):
+        # Clear existing
+        for i in reversed(range(self.grid_layout.count())):
+            item = self.grid_layout.itemAt(i)
+            if item and item.widget():
+                w = item.widget()
+                w.setParent(None)
+
+        row, col = 0, 0
+        max_cols = 4
+        for i, vid in enumerate(results):
+            widget = self.create_video_thumb(vid)
+            self.grid_layout.addWidget(widget, row, col)
+            col += 1
+            if col >= max_cols:
+                col = 0
+                row += 1
+
+    def create_video_thumb(self, video_data):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(5)
+
+        # Thumbnail label
+        thumb_label = QLabel()
+        thumb_label.setFixedSize(320,180)
+        thumb_label.setStyleSheet("background-color: #000;")
+        # If we have a thumbnail, fetch it asynchronously
+        if video_data.get("thumbnail"):
+            url = video_data["thumbnail"]
+            # We'll do a background fetch
+            worker = Worker(self.fetch_thumb_image, url)
+            # We pass the label so we can update once done
+            def on_thumb_fetched(result):
+                if isinstance(result, Exception):
+                    self.console_output.append(f"Error fetching thumbnail: {result}")
+                else:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(result)
+                    pixmap = pixmap.scaled(320,180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    thumb_label.setPixmap(pixmap)
+            worker.signals.finished.connect(on_thumb_fetched)
+            self.threadpool.start(worker)
+
+        # Title
+        title_label = QLabel(video_data["title"])
+        title_label.setFixedWidth(320)
+        title_label.setWordWrap(True)
+        font = QFont()
+        font.setPointSize(11)
+        title_label.setFont(font)
+
+        layout.addWidget(thumb_label, 0, Qt.AlignCenter)
+        layout.addWidget(title_label, 0, Qt.AlignCenter)
+
+        # Clicking the thumbnail => start extraction
+        def on_thumb_click(_):
+            self.console_output.append(f"Clicked: {video_data['title']}")
+            self.start_extraction(video_data["videoId"])
+        thumb_label.mousePressEvent = on_thumb_click
+
+        return w
+
+    def fetch_thumb_image(self, url):
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=5)
+        resp.raise_for_status()
+        return resp.content
+
+    # ------------------
+    # Playback page
+    def create_playback_page(self):
+        page = QWidget()
+        hlayout = QHBoxLayout(page)
+        hlayout.setContentsMargins(10,10,10,10)
+        # mpv area
+        self.mpv_playback_widget = QWidget()
+        self.mpv_playback_widget.setStyleSheet("background-color: #333;")
+        # Let it expand
+        sizePolicy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.mpv_playback_widget.setSizePolicy(sizePolicy)
+        hlayout.addWidget(self.mpv_playback_widget, 1)
+
+        # Right side (related videos if needed)
+        self.related_list = QListWidget()
+        self.related_list.setFixedWidth(300)
+        hlayout.addWidget(self.related_list, 0)
+
+        return page
+
+    # ------------------
+    # Searching logic
+    def do_search(self):
+        query = self.search_field.text().strip()
         if not query:
-            self.console_output.append("Please enter a search query.")
+            self.console_output.append("No search query.")
             return
-        self.console_output.append(f"Searching for: {query} ...")
-        self.video_list.clear()
-        self.search_results.clear()
-        worker = Worker(search_youtube, query, max_results=20)
-        worker.signals.finished.connect(self.on_search_done)
+        self.console_output.append(f"Searching: {query}")
+        # Clear old grid
+        self.populate_home_grid([])
+        # Kick off worker
+        worker = Worker(search_youtube, query, 20)
+        worker.signals.finished.connect(self.on_search_results)
         self.threadpool.start(worker)
 
-    def on_search_done(self, result):
+    def on_search_results(self, result):
         if isinstance(result, Exception):
             self.console_output.append(f"Search error: {result}")
             return
-        self.search_results = result
-        self.console_output.append(f"Found {len(result)} videos.")
-        for i, item in enumerate(result):
-            lw_item = QListWidgetItem(item["title"])
-            lw_item.setData(Qt.UserRole, item)
-            self.video_list.addItem(lw_item)
-            thumb_url = item.get("thumbnail")
-            if thumb_url:
-                w = Worker(self.fetch_thumbnail, thumb_url, i)
-                w.signals.finished.connect(self.on_thumbnail_fetched)
-                self.threadpool.start(w)
+        self.console_output.append(f"Got {len(result)} results.")
+        self.populate_home_grid(result)
+        self.stacked_widget.setCurrentIndex(0)
 
-    def fetch_thumbnail(self, url, index):
-        resp = requests.get(url, timeout=5, headers={"User-Agent": USER_AGENT})
-        resp.raise_for_status()
-        return (index, resp.content)
-
-    def on_thumbnail_fetched(self, result):
-        if isinstance(result, Exception):
-            self.console_output.append(f"Thumbnail error: {result}")
-            return
-        index, content = result
-        if index < 0 or index >= self.video_list.count():
-            return
-        item = self.video_list.item(index)
-        pix = QPixmap()
-        pix.loadFromData(content)
-        pix = pix.scaled(320, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        icon = QIcon(pix)
-        item.setIcon(icon)
-        item.setSizeHint(QSize(340, 200))
-
-    ############################
-    # Video Selection & Dynamic Quality
-
-    def on_video_clicked(self, item):
-        data = item.data(Qt.UserRole)
-        if not data:
-            return
-        self.console_output.append(f"Selected video: {data['title']}")
-        self.current_video_url = data["videoId"]
-        if not self.current_video_url.startswith("http"):
-            self.current_video_url = f"https://www.youtube.com/watch?v={self.current_video_url}"
-        worker = Worker(self.extract_with_fallback_bg, self.current_video_url)
+    # Extraction fallback
+    def start_extraction(self, url):
+        self.console_output.append(f"Extracting info for: {url}")
+        worker = Worker(self.extract_with_fallback, url)
         worker.signals.finished.connect(self.on_extraction_done)
         self.threadpool.start(worker)
+        # Switch to playback page
+        self.stacked_widget.setCurrentIndex(1)
 
-    def extract_with_fallback_bg(self, video_url):
+    def extract_with_fallback(self, video_url):
         try:
-            info = extract_formats(video_url, cookies_file=None)
+            info = extract_formats(video_url)
             return ("no_cookies", info)
         except Exception as e:
             if not os.path.exists("cookies.txt"):
@@ -375,120 +423,63 @@ class YouTubeClient(QMainWindow):
             return
         mode, info = result
         self.current_info = info
+        if "original_url" in info:
+            self.current_video_url = info["original_url"]
+        elif "webpage_url" in info:
+            self.current_video_url = info["webpage_url"]
+        else:
+            self.current_video_url = None
+
         if mode == "no_cookies":
-            self.console_output.append("Extraction succeeded without cookies.")
+            self.console_output.append("Extraction ok (no cookies).")
         else:
-            self.console_output.append("Extraction succeeded with cookies fallback.")
-        # Dynamically determine available quality buckets.
-        available = available_buckets(info)
-        self.bucketed_formats = available  # list of labels
+            self.console_output.append("Extraction ok (cookies fallback).")
+
+        # Determine available qualities
+        self.qualities_available = available_buckets(info)
+        if not self.qualities_available:
+            self.qualities_available = ["360p"]
+        # Populate top-bar combo
         self.quality_combo.clear()
-        for label in available:
-            self.quality_combo.addItem(label)
-        if self.quality_combo.count() > 0:
-            self.quality_combo.setCurrentIndex(0)
-        self.watch_button.setVisible(True)
-        if self.has_separate_streams(info):
-            self.watch_separate_button.setVisible(True)
-        else:
-            self.watch_separate_button.setVisible(False)
-        self.console_output.append("Quality options updated: " + ", ".join(available))
+        for q in self.qualities_available:
+            self.quality_combo.addItem(q)
+        self.console_output.append(f"Available: {self.qualities_available}")
 
-    def has_separate_streams(self, info):
-        video_only = False
-        audio_only = False
-        for fmt in info.get("formats", []):
-            if fmt.get("acodec") == "none":
-                video_only = True
-            if fmt.get("vcodec") == "none":
-                audio_only = True
-        return video_only and audio_only
+        # Auto-play at first quality
+        first_q = self.qualities_available[0]
+        self.launch_mpv_merged(first_q)
 
-    ############################
-    # Playback (Merged Mode)
+        # If you want to fill "related_list" with suggestions, do so here
+        self.related_list.clear()
+        # Placeholder
+        for i in range(5):
+            self.related_list.addItem(f"Related Video {i+1}")
 
-    def watch_video(self):
+    # ------------------
+    # mpv playback
+    def launch_mpv_merged(self, quality_label):
         if not self.current_video_url:
-            self.console_output.append("No video selected.")
+            self.console_output.append("No URL to play.")
             return
-        selected_label = self.quality_combo.currentText()
-        fmt_string = FORMAT_MAPPING.get(selected_label, "best")
+        mpv_format = FORMAT_MAPPING.get(quality_label, "best")
         mpv_args = [
             "--osc",
             "--cache=yes",
             "--demuxer-thread=yes",
-            f"--ytdl-format={fmt_string}",
+            f"--ytdl-format={mpv_format}",
             f"--log-file={LOG_FILE}",
             "--msg-level=all=v",
             "--input-ipc-server=/tmp/mpvsocket",
             self.current_video_url
         ]
         if not self.is_detached:
-            wid = str(int(self.mpv_widget.winId()))
+            # embed
+            wid = str(int(self.mpv_playback_widget.winId()))
             mpv_args.insert(0, f"--wid={wid}")
         self.kill_mpv()
-        self.console_output.append(f"Launching merged mpv with quality '{selected_label}', format='{fmt_string}' ...")
-        self.console_output.append(f"mpv logs will be in {LOG_FILE}")
+        self.console_output.append(f"Launching mpv with {quality_label} => {mpv_format}")
         self.player_process = QProcess(self)
         self.player_process.start("mpv", mpv_args)
-        if self.is_detached:
-            self.console_output.append("Playback started in detached mode (merged).")
-        else:
-            self.console_output.append("Playback started embedded (merged).")
-
-    ############################
-    # Playback (Separate Streams Mode)
-
-    def watch_separate_streams(self):
-        if not self.current_info:
-            self.console_output.append("No video info available for separate streams.")
-            return
-        video_only_url = None
-        audio_only_url = None
-        for fmt in self.current_info.get("formats", []):
-            if fmt.get("acodec") == "none" and not video_only_url:
-                video_only_url = fmt.get("url")
-            if fmt.get("vcodec") == "none" and not audio_only_url:
-                audio_only_url = fmt.get("url")
-        if not video_only_url or not audio_only_url:
-            self.console_output.append("Separate video-only and audio-only streams not available; falling back to merged mode.")
-            self.watch_video()
-            return
-        video_ipc = "/tmp/mpv_video"
-        audio_ipc = "/tmp/mpv_audio"
-        video_args = [
-            "--no-audio",
-            "--osc",
-            "--cache=yes",
-            "--demuxer-thread=yes",
-            f"--input-ipc-server={video_ipc}",
-            video_only_url
-        ]
-        audio_args = [
-            "--no-video",
-            "--osc",
-            "--cache=yes",
-            "--demuxer-thread=yes",
-            f"--input-ipc-server={audio_ipc}",
-            audio_only_url
-        ]
-        if not self.is_detached:
-            wid = str(int(self.mpv_widget.winId()))
-            video_args.insert(0, f"--wid={wid}")
-        self.kill_mpv()
-        self.console_output.append("Launching separate mpv processes for video and audio streams...")
-        self.video_process = QProcess(self)
-        self.video_process.start("mpv", video_args)
-        self.audio_process = QProcess(self)
-        self.audio_process.start("mpv", audio_args)
-        self.console_output.append("Separate streams launched.")
-        self.sync_timer.start(1000)
-
-    def check_sync(self):
-        self.console_output.append("Sync check (stub): ensure video and audio are in sync.")
-
-    ############################
-    # Kill mpv Processes
 
     def kill_mpv(self):
         os_type = platform.system()
@@ -499,65 +490,95 @@ class YouTubeClient(QMainWindow):
         elif os_type == "Darwin":
             os.system("pkill mpv")
         else:
-            self.console_output.append("Unsupported OS for killing mpv.")
+            self.console_output.append("Unsupported OS for kill mpv.")
 
-    def toggle_attach_detach(self):
+    def toggle_detach(self):
         self.is_detached = not self.is_detached
         if self.is_detached:
-            self.attach_detach_button.setText("Attach Video")
-            self.console_output.append("Video will now be detached.")
+            self.detach_button.setText("Attach")
+            self.console_output.append("Now in detached mode.")
         else:
-            self.attach_detach_button.setText("Detach Video")
-            self.console_output.append("Video will now be embedded.")
-        if self.current_video_url:
-            self.watch_video()
+            self.detach_button.setText("Detach")
+            self.console_output.append("Now in embedded mode.")
+        # If something is playing, relaunch
+        if self.current_video_url and self.player_process:
+            self.launch_mpv_merged(self.quality_combo.currentText())
 
-    ############################
-    # Playlist
+    def toggle_fullscreen(self):
+        # Send IPC command to mpv to cycle fullscreen
+        try:
+            cmd = b'cycle fullscreen\n'
+            # We can do this only if we have an IPC socket
+            if self.player_process:
+                # Not directly accessible, so let's open /tmp/mpvsocket
+                with open("/tmp/mpvsocket", "wb") as f:
+                    f.write(cmd)
+            self.console_output.append("Toggled fullscreen via IPC.")
+        except Exception as e:
+            self.console_output.append(f"Fullscreen toggle failed: {e}")
 
-    def add_to_playlist(self):
-        if self.current_video_url:
-            self.playlist.append(self.current_video_url)
-            self.console_output.append(f"Added to playlist: {self.current_video_url}")
-
-    def play_playlist(self):
-        if not self.playlist:
-            self.console_output.append("Playlist is empty.")
+    # For separate streams
+    def watch_separate_streams(self):
+        if not self.current_info:
+            self.console_output.append("No video info for separate streams.")
             return
-        next_url = self.playlist.pop(0)
-        self.console_output.append(f"Playing from playlist: {next_url}")
-        self.current_video_url = next_url
-        worker = Worker(self.extract_with_fallback_bg, self.current_video_url)
-        worker.signals.finished.connect(self.on_extraction_done)
-        self.threadpool.start(worker)
+        formats = self.current_info.get("formats", [])
+        video_only_url = None
+        audio_only_url = None
+        for f in formats:
+            if f.get("acodec") == "none" and not video_only_url:
+                video_only_url = f["url"]
+            if f.get("vcodec") == "none" and not audio_only_url:
+                audio_only_url = f["url"]
+        if not video_only_url or not audio_only_url:
+            self.console_output.append("No separate video/audio => fallback merged.")
+            self.launch_mpv_merged(self.quality_combo.currentText())
+            return
 
-    ############################
-    # Basic UI Controls
+        self.kill_mpv()
+        video_ipc = "/tmp/mpv_video"
+        audio_ipc = "/tmp/mpv_audio"
+        video_args = [
+            "--no-audio", "--osc", "--cache=yes", "--demuxer-thread=yes",
+            f"--input-ipc-server={video_ipc}", video_only_url
+        ]
+        audio_args = [
+            "--no-video", "--osc", "--cache=yes", "--demuxer-thread=yes",
+            f"--input-ipc-server={audio_ipc}", audio_only_url
+        ]
+        if not self.is_detached:
+            wid = str(int(self.mpv_playback_widget.winId()))
+            video_args.insert(0, f"--wid={wid}")
 
+        self.console_output.append("Launching separate mpv processes.")
+        self.video_process = QProcess(self)
+        self.video_process.start("mpv", video_args)
+        self.audio_process = QProcess(self)
+        self.audio_process.start("mpv", audio_args)
+        self.sync_timer.start(1000)
+
+    def check_sync(self):
+        self.console_output.append("Stub sync check (separate streams).")
+
+    # ------------------
+    # Dark Mode
     def toggle_dark_mode(self):
         palette = self.palette()
         if palette.color(QPalette.Window) == QColor(255, 255, 255):
+            # Switch to dark
             palette.setColor(QPalette.Window, QColor(53, 53, 53))
             palette.setColor(QPalette.WindowText, QColor(255, 255, 255))
             self.console_output.setStyleSheet("background-color: #2c2c2c; color: white;")
         else:
+            # Switch to light
             palette.setColor(QPalette.Window, QColor(255, 255, 255))
             palette.setColor(QPalette.WindowText, QColor(0, 0, 0))
             self.console_output.setStyleSheet("background-color: white; color: black;")
         self.setPalette(palette)
 
-    def play_pause_video(self):
-        self.console_output.append("Play/Pause not wired (use mpv keybindings).")
-
-    def toggle_fullscreen(self):
-        self.console_output.append("Fullscreen not wired (use mpv keybindings).")
-
-    def fast_forward_video(self):
-        self.console_output.append("Fast Forward not wired (use mpv keybindings).")
-
 def main():
     app = QApplication(sys.argv)
-    client = YouTubeClient()
+    client = ModernYouTubeClient()
     client.show()
     sys.exit(app.exec_())
 

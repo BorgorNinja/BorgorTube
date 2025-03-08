@@ -24,7 +24,7 @@ BorgorTube is a desktop application that allows users to search for YouTube vide
 1. **Clone the Repository**
 
    ```bash
-   git clone https://github.com/yourusername/YouTubeClient.git](https://github.com/BorgorNinja/BorgorTube
+   git clone https://github.com/BorgorNinja/BorgorTube
    cd BorgorTube
    ```
 

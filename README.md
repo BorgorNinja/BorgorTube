@@ -19,6 +19,7 @@ BorgorTube is a desktop application that allows users to search for YouTube vide
 - requests
 - MPV media player (installed separately)
 - pyppeteer
+- requests-cache
 ## Installation
 
 1. **Clone the Repository**

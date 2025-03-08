@@ -3,3 +3,4 @@ pyppeteer
 requests
 yt_dlp
 requests-cache
+bs4

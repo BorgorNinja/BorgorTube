@@ -71,7 +71,8 @@ BorgorTube is a desktop application that allows users to search for YouTube vide
 
 4. **Pagination**
 
-   Use the "Next Page" and "Previous Page" buttons to navigate through search result pages.
+   -Use the "Next Page" and "Previous Page" buttons to navigate through search result pages.-
+   (this part is scrapped, its now scrollable
 
 ## Code Overview
 

@@ -4,8 +4,11 @@ import json
 import asyncio
 import platform
 import requests
-from pyppeteer import launch
+import socket
+from bs4 import BeautifulSoup
+
 import yt_dlp
+from pyppeteer import launch
 
 from PyQt5.QtCore import (
     QProcess, Qt, QThreadPool, QRunnable, pyqtSlot, QObject, pyqtSignal,
@@ -14,8 +17,7 @@ from PyQt5.QtCore import (
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QScrollArea, QGridLayout, QLineEdit, QPushButton, QLabel, QTextEdit,
-    QComboBox, QListWidget, QListWidgetItem, QStackedWidget, QSpacerItem,
-    QSizePolicy
+    QComboBox, QStackedWidget, QSizePolicy
 )
 from PyQt5.QtGui import QPixmap, QIcon, QPalette, QColor, QFont
 
@@ -40,12 +42,18 @@ FORMAT_MAPPING = {
 }
 ALL_QUALITIES = list(FORMAT_MAPPING.keys())
 
+# Global caches
+search_cache = {}
+thumbnail_cache = {}
+extraction_cache = {}
+channel_videos_cache = {}  # channel_url -> list of videos
+
 SETTINGS_FILE = "settings.json"
 LOG_FILE = "mpvlog.txt"
 
 #################################
-# Check which “buckets” are available
 def available_buckets(info):
+    """Return the list of available quality 'buckets' for the given video info."""
     formats = info.get("formats", [])
     bucket_avail = set()
     for f in formats:
@@ -67,15 +75,91 @@ def available_buckets(info):
             bucket_avail.add("240p")
         if h >= 144 and h < 240:
             bucket_avail.add("144p")
-    # Return in descending order as in ALL_QUALITIES
-    result = []
-    for q in ALL_QUALITIES:
-        if q in bucket_avail:
-            result.append(q)
-    return result
+    result = [q for q in ALL_QUALITIES if q in bucket_avail]
+    return result if result else ["360p"]
+
+def get_current_playback_time(ipc_path="/tmp/mpvsocket"):
+    """Query mpv's current playback time via IPC."""
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(ipc_path)
+        cmd = {"command": ["get_property", "time-pos"]}
+        sock.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
+        response = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+            if b"\n" in chunk:
+                break
+        sock.close()
+        data = json.loads(response.decode("utf-8").strip())
+        if "data" in data:
+            return float(data["data"])
+    except Exception as e:
+        print("Error getting playback time:", e)
+    return 0.0
 
 #################################
-# Cookie fallback for restricted videos
+# Channel scraping
+def scrape_channel_avatar(channel_url):
+    """Scrape channel page's HTML for channel avatar (fragile approach)."""
+    if not channel_url:
+        return None
+    try:
+        r = requests.get(channel_url, headers={"User-Agent": USER_AGENT}, timeout=5)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        # e.g. <meta property="og:image" content="...">
+        og_image = soup.find("meta", property="og:image")
+        if og_image and og_image.get("content"):
+            return og_image["content"]
+    except Exception as e:
+        print("scrape_channel_avatar error:", e)
+    return None
+
+def get_channel_videos(channel_url, max_results=20):
+    """Use yt-dlp to get channel's videos in extract_flat mode."""
+    if not channel_url:
+        return []
+    cache_key = (channel_url, max_results)
+    if cache_key in channel_videos_cache:
+        return channel_videos_cache[cache_key]
+
+    opts = {
+        "quiet": True,
+        "dump_single_json": True,
+        "extract_flat": True,
+        "http_headers": {"User-Agent": USER_AGENT},
+    }
+    results = []
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(channel_url, download=False)
+            entries = data.get("entries", [])
+            count = 0
+            for entry in entries:
+                if entry.get("url"):
+                    thumb = ""
+                    if entry.get("thumbnails"):
+                        thumb = entry["thumbnails"][-1]["url"]
+                    results.append({
+                        "title": entry.get("title", "Unknown"),
+                        "videoId": entry["url"],
+                        "thumbnail": thumb
+                    })
+                    count += 1
+                    if count >= max_results:
+                        break
+    except Exception as e:
+        print("get_channel_videos error:", e)
+
+    channel_videos_cache[cache_key] = results
+    return results
+
+#################################
+# Cookie fallback
 async def get_cookies_headless(video_url):
     print("Launching headless Chromium for cookie extraction...")
     browser = await launch(headless=True, args=["--no-sandbox"])
@@ -98,15 +182,16 @@ def save_cookies_to_file(cookies, filename="cookies.txt"):
             expiry = str(c.get("expires", 0))
             name = c.get("name", "")
             value = c.get("value", "")
-            f.write("\t".join([
-                domain, flag, path, secure, expiry, name, value
-            ]) + "\n")
+            f.write("\t".join([domain, flag, path, secure, expiry, name, value]) + "\n")
     print("Cookies saved to", filename)
     return filename
 
 #################################
-# Searching & extraction
+# Searching with caching
 def search_youtube(query, max_results=20):
+    cache_key = (query, max_results)
+    if cache_key in search_cache:
+        return search_cache[cache_key]
     expr = f"ytsearch{max_results}:{query}"
     opts = {
         "quiet": True,
@@ -128,9 +213,15 @@ def search_youtube(query, max_results=20):
                 "videoId": entry["url"],
                 "thumbnail": thumb
             })
-        return results
+    search_cache[cache_key] = results
+    return results
 
+#################################
+# Extraction with caching
 def extract_formats(video_url, cookies_file=None):
+    cache_key = (video_url, cookies_file)
+    if cache_key in extraction_cache:
+        return extraction_cache[cache_key]
     opts = {
         "quiet": True,
         "skip_download": True,
@@ -141,10 +232,11 @@ def extract_formats(video_url, cookies_file=None):
         opts["cookies"] = cookies_file
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
-        return info
+    extraction_cache[cache_key] = info
+    return info
 
 #################################
-# Thread worker
+# Worker for background tasks
 class WorkerSignals(QObject):
     finished = pyqtSignal(object)
 
@@ -165,14 +257,15 @@ class Worker(QRunnable):
             self.signals.finished.emit(e)
 
 #################################
-# Main Window
+# Main Application
 class ModernYouTubeClient(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BorgorTube")
         self.resize(1280, 800)
-
         self.threadpool = QThreadPool()
+
+        # Current video and channel data
         self.current_info = None
         self.current_video_url = None
         self.qualities_available = []
@@ -182,39 +275,44 @@ class ModernYouTubeClient(QMainWindow):
         self.video_process = None
         self.audio_process = None
 
-        # Timer for sync (separate streams)
+        self.channel_avatar_url = None
+        self.channel_name = None
+        self.channel_url = None
+        self.video_title = None
+        self.video_description = None
+
         self.sync_timer = QTimer()
         self.sync_timer.timeout.connect(self.check_sync)
 
-        # Build UI
         self.build_ui()
 
     def build_ui(self):
-        # Main vertical container
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_vlayout = QVBoxLayout(central_widget)
-        main_vlayout.setContentsMargins(0,0,0,0)
+        main_vlayout.setContentsMargins(0, 0, 0, 0)
         main_vlayout.setSpacing(0)
 
         # 1) Top bar
         self.top_bar = self.create_top_bar()
         main_vlayout.addWidget(self.top_bar, 0)
 
-        # 2) Stacked widget for pages
+        # 2) Stacked widget: home, playback, channel
         self.stacked_widget = QStackedWidget()
         self.home_page = self.create_home_page()
         self.playback_page = self.create_playback_page()
+        self.channel_page = self.create_channel_page()
+
         self.stacked_widget.addWidget(self.home_page)     # index 0
         self.stacked_widget.addWidget(self.playback_page) # index 1
-
+        self.stacked_widget.addWidget(self.channel_page)  # index 2
         main_vlayout.addWidget(self.stacked_widget, 1)
 
-        # 3) Console output at bottom
+        # 3) Console output
         self.console_output = QTextEdit()
         self.console_output.setReadOnly(True)
         self.console_output.setFixedHeight(150)
-        main_vlayout.addWidget(self.console_output)
+        main_vlayout.addWidget(self.console_output, 0)
 
         self.stacked_widget.setCurrentIndex(0)
 
@@ -223,13 +321,18 @@ class ModernYouTubeClient(QMainWindow):
     def create_top_bar(self):
         top_widget = QWidget()
         layout = QHBoxLayout(top_widget)
-        layout.setContentsMargins(10,5,10,5)
+        layout.setContentsMargins(10, 5, 10, 5)
+
+        # Back button
+        self.back_button = QPushButton("Back")
+        self.back_button.clicked.connect(self.go_back)
+        layout.addWidget(self.back_button)
 
         # Search field
         self.search_field = QLineEdit()
         self.search_field.setPlaceholderText("Search or paste YouTube URL")
         self.search_field.returnPressed.connect(self.do_search)
-        layout.addWidget(self.search_field)
+        layout.addWidget(self.search_field, 1)
 
         # Search button
         self.search_button = QPushButton("Search")
@@ -238,60 +341,68 @@ class ModernYouTubeClient(QMainWindow):
 
         # Quality combo
         self.quality_combo = QComboBox()
-        # We'll fill it dynamically once we know what's available
-        # But let's default to "360p" if none
         self.quality_combo.addItem("360p")
+        self.quality_combo.currentIndexChanged.connect(self.on_quality_changed)
         layout.addWidget(self.quality_combo)
 
-        # Detach
+        # Detach button
         self.detach_button = QPushButton("Detach")
         self.detach_button.clicked.connect(self.toggle_detach)
         layout.addWidget(self.detach_button)
 
-        # Fullscreen
+        # Fullscreen button
         self.fullscreen_button = QPushButton("Fullscreen")
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         layout.addWidget(self.fullscreen_button)
 
-        # Dark Mode
+        # Dark mode
         self.dark_button = QPushButton("Dark Mode")
         self.dark_button.clicked.connect(self.toggle_dark_mode)
         layout.addWidget(self.dark_button)
 
         return top_widget
 
+    def go_back(self):
+        idx = self.stacked_widget.currentIndex()
+        if idx == 2:  # channel
+            if self.current_video_url and self.player_process:
+                self.stacked_widget.setCurrentIndex(1)
+                self.console_output.append("Back to playback from channel page.")
+            else:
+                self.stacked_widget.setCurrentIndex(0)
+                self.console_output.append("Back to home from channel page.")
+        elif idx == 1:  # playback
+            self.stacked_widget.setCurrentIndex(0)
+            self.console_output.append("Back to home from playback page.")
+        else:
+            self.console_output.append("Already on home page.")
+
     # ------------------
     # Home page
     def create_home_page(self):
         page = QWidget()
         vlayout = QVBoxLayout(page)
-        vlayout.setContentsMargins(5,5,5,5)
+        vlayout.setContentsMargins(5, 5, 5, 5)
 
-        # Label
         self.home_label = QLabel("Search Results")
         self.home_label.setStyleSheet("font-size: 18px; font-weight: bold;")
         vlayout.addWidget(self.home_label, 0, Qt.AlignTop)
 
-        # Scrollable area with grid
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.grid_container = QWidget()
         self.grid_layout = QGridLayout(self.grid_container)
         self.grid_layout.setSpacing(10)
-        self.grid_layout.setContentsMargins(10,10,10,10)
+        self.grid_layout.setContentsMargins(10, 10, 10, 10)
         self.scroll_area.setWidget(self.grid_container)
-
         vlayout.addWidget(self.scroll_area, 1)
         return page
 
     def populate_home_grid(self, results):
-        # Clear existing
         for i in reversed(range(self.grid_layout.count())):
             item = self.grid_layout.itemAt(i)
             if item and item.widget():
-                w = item.widget()
-                w.setParent(None)
-
+                item.widget().setParent(None)
         row, col = 0, 0
         max_cols = 4
         for i, vid in enumerate(results):
@@ -305,31 +416,31 @@ class ModernYouTubeClient(QMainWindow):
     def create_video_thumb(self, video_data):
         w = QWidget()
         layout = QVBoxLayout(w)
-        layout.setContentsMargins(0,0,0,0)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
 
-        # Thumbnail label
         thumb_label = QLabel()
-        thumb_label.setFixedSize(320,180)
+        thumb_label.setFixedSize(320, 180)
         thumb_label.setStyleSheet("background-color: #000;")
-        # If we have a thumbnail, fetch it asynchronously
-        if video_data.get("thumbnail"):
-            url = video_data["thumbnail"]
-            # We'll do a background fetch
-            worker = Worker(self.fetch_thumb_image, url)
-            # We pass the label so we can update once done
-            def on_thumb_fetched(result):
-                if isinstance(result, Exception):
-                    self.console_output.append(f"Error fetching thumbnail: {result}")
-                else:
-                    pixmap = QPixmap()
-                    pixmap.loadFromData(result)
-                    pixmap = pixmap.scaled(320,180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    thumb_label.setPixmap(pixmap)
-            worker.signals.finished.connect(on_thumb_fetched)
-            self.threadpool.start(worker)
+        url = video_data.get("thumbnail")
+        if url:
+            if url in thumbnail_cache:
+                pixmap = QPixmap()
+                pixmap.loadFromData(thumbnail_cache[url])
+                pixmap = pixmap.scaled(320, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                thumb_label.setPixmap(pixmap)
+            else:
+                worker = Worker(self.fetch_thumb_image, url)
+                def done(res):
+                    if not isinstance(res, Exception):
+                        thumbnail_cache[url] = res
+                        px = QPixmap()
+                        px.loadFromData(res)
+                        px = px.scaled(320, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        thumb_label.setPixmap(px)
+                worker.signals.finished.connect(done)
+                self.threadpool.start(worker)
 
-        # Title
         title_label = QLabel(video_data["title"])
         title_label.setFixedWidth(320)
         title_label.setWordWrap(True)
@@ -340,7 +451,6 @@ class ModernYouTubeClient(QMainWindow):
         layout.addWidget(thumb_label, 0, Qt.AlignCenter)
         layout.addWidget(title_label, 0, Qt.AlignCenter)
 
-        # Clicking the thumbnail => start extraction
         def on_thumb_click(_):
             self.console_output.append(f"Clicked: {video_data['title']}")
             self.start_extraction(video_data["videoId"])
@@ -357,34 +467,244 @@ class ModernYouTubeClient(QMainWindow):
     # Playback page
     def create_playback_page(self):
         page = QWidget()
-        hlayout = QHBoxLayout(page)
-        hlayout.setContentsMargins(10,10,10,10)
-        # mpv area
+        vlayout = QVBoxLayout(page)
+        vlayout.setContentsMargins(10,10,10,10)
+        vlayout.setSpacing(10)
+
+        # MPV area
         self.mpv_playback_widget = QWidget()
         self.mpv_playback_widget.setStyleSheet("background-color: #333;")
-        # Let it expand
-        sizePolicy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.mpv_playback_widget.setSizePolicy(sizePolicy)
-        hlayout.addWidget(self.mpv_playback_widget, 1)
+        self.mpv_playback_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.mpv_playback_widget.setMinimumHeight(400)
+        vlayout.addWidget(self.mpv_playback_widget, 2)
 
-        # Right side (related videos if needed)
-        self.related_list = QListWidget()
-        self.related_list.setFixedWidth(300)
-        hlayout.addWidget(self.related_list, 0)
+        # Title + Channel row + Description
+        info_container = QWidget()
+        info_layout = QVBoxLayout(info_container)
+        info_layout.setSpacing(5)
+
+        # Title
+        self.video_title_label = QLabel("Video Title Here")
+        self.video_title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        info_layout.addWidget(self.video_title_label, 0)
+
+        # Channel row
+        channel_row = QWidget()
+        channel_hlayout = QHBoxLayout(channel_row)
+        channel_hlayout.setSpacing(10)
+        channel_hlayout.setContentsMargins(0,0,0,0)
+
+        self.channel_avatar_label = QLabel()
+        self.channel_avatar_label.setFixedSize(48,48)
+        self.channel_avatar_label.setStyleSheet("background-color: #ccc;")
+
+        self.channel_name_label = QLabel("Channel Name")
+        ch_font = QFont()
+        ch_font.setPointSize(13)
+        ch_font.setBold(True)
+        self.channel_name_label.setFont(ch_font)
+
+        channel_hlayout.addWidget(self.channel_avatar_label, 0, Qt.AlignVCenter | Qt.AlignLeft)
+        channel_hlayout.addWidget(self.channel_name_label, 0, Qt.AlignVCenter | Qt.AlignLeft)
+        channel_row.setLayout(channel_hlayout)
+        info_layout.addWidget(channel_row, 0)
+
+        # Scrollable description
+        desc_scroll = QScrollArea()
+        desc_scroll.setWidgetResizable(True)
+        desc_widget = QWidget()
+        desc_layout = QVBoxLayout(desc_widget)
+        desc_layout.setContentsMargins(0,0,0,0)
+
+        self.video_desc_label = QLabel("Video description goes here. Potentially very long.")
+        self.video_desc_label.setWordWrap(True)
+        desc_layout.addWidget(self.video_desc_label, 1)
+
+        desc_widget.setLayout(desc_layout)
+        desc_scroll.setWidget(desc_widget)
+        desc_scroll.setFixedHeight(200)
+        info_layout.addWidget(desc_scroll)
+
+        info_container.setLayout(info_layout)
+        vlayout.addWidget(info_container, 1)
 
         return page
 
     # ------------------
-    # Searching logic
+    # Channel page
+    def create_channel_page(self):
+        page = QWidget()
+        vlayout = QVBoxLayout(page)
+        vlayout.setContentsMargins(10,10,10,10)
+
+        # Channel top
+        top_container = QWidget()
+        top_layout = QHBoxLayout(top_container)
+        top_layout.setSpacing(10)
+        top_layout.setContentsMargins(0,0,0,0)
+
+        self.channel_avatar_big = QLabel()
+        self.channel_avatar_big.setFixedSize(100,100)
+        self.channel_avatar_big.setStyleSheet("background-color: #ccc;")
+
+        # Vertical for channel name + subs
+        vchan = QVBoxLayout()
+        self.channel_name_big = QLabel("Channel Name")
+        ch_font = QFont()
+        ch_font.setPointSize(16)
+        ch_font.setBold(True)
+        self.channel_name_big.setFont(ch_font)
+
+        self.channel_subs_label = QLabel("Subscriber count: ???")
+
+        vchan.addWidget(self.channel_name_big, 0, Qt.AlignLeft)
+        vchan.addWidget(self.channel_subs_label, 0, Qt.AlignLeft)
+
+        top_layout.addWidget(self.channel_avatar_big, 0, Qt.AlignVCenter)
+        top_layout.addLayout(vchan, 1)
+
+        vlayout.addWidget(top_container, 0, Qt.AlignLeft)
+
+        # Now a scrollable area for channel videos
+        self.channel_scroll = QScrollArea()
+        self.channel_scroll.setWidgetResizable(True)
+        self.channel_videos_container = QWidget()
+        self.channel_videos_layout = QGridLayout(self.channel_videos_container)
+        self.channel_videos_layout.setSpacing(10)
+        self.channel_videos_layout.setContentsMargins(10,10,10,10)
+        self.channel_scroll.setWidget(self.channel_videos_container)
+        vlayout.addWidget(self.channel_scroll, 1)
+
+        return page
+
+    def show_channel_page(self):
+        """Fill the channel page with self.channel_* data, scraping the avatar if needed,
+           and listing channel videos."""
+        if self.channel_url and not self.channel_avatar_url:
+            self.channel_avatar_url = scrape_channel_avatar(self.channel_url)
+
+        # Clear old channel videos from layout
+        for i in reversed(range(self.channel_videos_layout.count())):
+            item = self.channel_videos_layout.itemAt(i)
+            if item and item.widget():
+                item.widget().setParent(None)
+
+        # Avatar
+        if self.channel_avatar_url:
+            if self.channel_avatar_url in thumbnail_cache:
+                data = thumbnail_cache[self.channel_avatar_url]
+                pix = QPixmap()
+                pix.loadFromData(data)
+                pix = pix.scaled(100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.channel_avatar_big.setPixmap(pix)
+            else:
+                try:
+                    r = requests.get(self.channel_avatar_url, headers={"User-Agent": USER_AGENT}, timeout=5)
+                    r.raise_for_status()
+                    thumbnail_cache[self.channel_avatar_url] = r.content
+                    pix = QPixmap()
+                    pix.loadFromData(r.content)
+                    pix = pix.scaled(100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    self.channel_avatar_big.setPixmap(pix)
+                except Exception as e:
+                    print("Error fetching channel avatar:", e)
+        else:
+            self.channel_avatar_big.setStyleSheet("background-color: #ccc;")
+
+        self.channel_name_big.setText(self.channel_name or "Unknown Channel")
+        self.channel_subs_label.setText("Subscriber count: ???")
+
+        # Fetch channel videos in background
+        worker = Worker(self.fetch_channel_videos_bg, self.channel_url)
+        worker.signals.finished.connect(self.on_channel_videos_fetched)
+        self.threadpool.start(worker)
+
+        self.stacked_widget.setCurrentIndex(2)
+
+    def fetch_channel_videos_bg(self, channel_url):
+        return get_channel_videos(channel_url, max_results=20)
+
+    def on_channel_videos_fetched(self, result):
+        if isinstance(result, Exception):
+            self.console_output.append(f"Error fetching channel videos: {result}")
+            return
+        self.populate_channel_grid(result)
+
+    def populate_channel_grid(self, videos):
+        # Clear existing
+        for i in reversed(range(self.channel_videos_layout.count())):
+            item = self.channel_videos_layout.itemAt(i)
+            if item and item.widget():
+                item.widget().setParent(None)
+
+        row, col = 0, 0
+        max_cols = 4
+        for vid in videos:
+            widget = self.create_channel_video_thumb(vid)
+            self.channel_videos_layout.addWidget(widget, row, col)
+            col += 1
+            if col >= max_cols:
+                col = 0
+                row += 1
+
+    def create_channel_video_thumb(self, video_data):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(5)
+
+        thumb_label = QLabel()
+        thumb_label.setFixedSize(320, 180)
+        thumb_label.setStyleSheet("background-color: #000;")
+        url = video_data.get("thumbnail")
+        if url:
+            if url in thumbnail_cache:
+                px = QPixmap()
+                px.loadFromData(thumbnail_cache[url])
+                px = px.scaled(320, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                thumb_label.setPixmap(px)
+            else:
+                def fetch_thumb(u):
+                    rr = requests.get(u, headers={"User-Agent": USER_AGENT}, timeout=5)
+                    rr.raise_for_status()
+                    return rr.content
+                worker = Worker(fetch_thumb, url)
+                def done(res):
+                    if not isinstance(res, Exception):
+                        thumbnail_cache[url] = res
+                        px = QPixmap()
+                        px.loadFromData(res)
+                        px = px.scaled(320, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        thumb_label.setPixmap(px)
+                worker.signals.finished.connect(done)
+                self.threadpool.start(worker)
+
+        title_label = QLabel(video_data["title"])
+        title_label.setFixedWidth(320)
+        title_label.setWordWrap(True)
+        font = QFont()
+        font.setPointSize(11)
+        title_label.setFont(font)
+
+        layout.addWidget(thumb_label, 0, Qt.AlignCenter)
+        layout.addWidget(title_label, 0, Qt.AlignCenter)
+
+        def on_thumb_click(_):
+            self.console_output.append(f"Channel video clicked: {video_data['title']}")
+            self.start_extraction(video_data["videoId"])
+        thumb_label.mousePressEvent = on_thumb_click
+
+        return w
+
+    # ------------------
+    # Searching & Extraction
     def do_search(self):
         query = self.search_field.text().strip()
         if not query:
             self.console_output.append("No search query.")
             return
         self.console_output.append(f"Searching: {query}")
-        # Clear old grid
         self.populate_home_grid([])
-        # Kick off worker
         worker = Worker(search_youtube, query, 20)
         worker.signals.finished.connect(self.on_search_results)
         self.threadpool.start(worker)
@@ -397,20 +717,18 @@ class ModernYouTubeClient(QMainWindow):
         self.populate_home_grid(result)
         self.stacked_widget.setCurrentIndex(0)
 
-    # Extraction fallback
     def start_extraction(self, url):
         self.console_output.append(f"Extracting info for: {url}")
         worker = Worker(self.extract_with_fallback, url)
         worker.signals.finished.connect(self.on_extraction_done)
         self.threadpool.start(worker)
-        # Switch to playback page
         self.stacked_widget.setCurrentIndex(1)
 
     def extract_with_fallback(self, video_url):
         try:
             info = extract_formats(video_url)
             return ("no_cookies", info)
-        except Exception as e:
+        except Exception:
             if not os.path.exists("cookies.txt"):
                 cookies = asyncio.run(get_cookies_headless(video_url))
                 save_cookies_to_file(cookies, "cookies.txt")
@@ -423,6 +741,7 @@ class ModernYouTubeClient(QMainWindow):
             return
         mode, info = result
         self.current_info = info
+
         if "original_url" in info:
             self.current_video_url = info["original_url"]
         elif "webpage_url" in info:
@@ -430,34 +749,78 @@ class ModernYouTubeClient(QMainWindow):
         else:
             self.current_video_url = None
 
+        # Channel info
+        self.channel_name = info.get("uploader", "Unknown Channel")
+        self.channel_url = info.get("uploader_url", "")
+        # Attempt to scrape the channel avatar now
+        self.channel_avatar_url = scrape_channel_avatar(self.channel_url)
+
+        self.video_title = info.get("title", "Untitled")
+        self.video_description = info.get("description", "No description available.")
+
         if mode == "no_cookies":
-            self.console_output.append("Extraction ok (no cookies).")
+            self.console_output.append("Extraction succeeded without cookies.")
         else:
-            self.console_output.append("Extraction ok (cookies fallback).")
+            self.console_output.append("Extraction succeeded with cookies fallback.")
 
         # Determine available qualities
         self.qualities_available = available_buckets(info)
-        if not self.qualities_available:
-            self.qualities_available = ["360p"]
-        # Populate top-bar combo
         self.quality_combo.clear()
         for q in self.qualities_available:
             self.quality_combo.addItem(q)
-        self.console_output.append(f"Available: {self.qualities_available}")
+        if self.qualities_available:
+            self.quality_combo.setCurrentIndex(0)
 
-        # Auto-play at first quality
-        first_q = self.qualities_available[0]
-        self.launch_mpv_merged(first_q)
+        # Fill the playback page fields
+        self.update_video_info_fields()
 
-        # If you want to fill "related_list" with suggestions, do so here
-        self.related_list.clear()
-        # Placeholder
-        for i in range(5):
-            self.related_list.addItem(f"Related Video {i+1}")
+        # Launch mpv at best
+        best = self.qualities_available[0] if self.qualities_available else "360p"
+        self.launch_mpv_merged(best)
+        self.console_output.append("Available qualities: " + ", ".join(self.qualities_available))
+
+    def update_video_info_fields(self):
+        self.video_title_label.setText(self.video_title or "Untitled")
+        self.video_desc_label.setText(self.video_description or "No description.")
+        self.channel_name_label.setText(self.channel_name or "Unknown Channel")
+
+        # If we have channel_avatar_url, fetch or check cache
+        if self.channel_avatar_url:
+            if self.channel_avatar_url in thumbnail_cache:
+                data = thumbnail_cache[self.channel_avatar_url]
+                px = QPixmap()
+                px.loadFromData(data)
+                px = px.scaled(48,48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.channel_avatar_label.setPixmap(px)
+            else:
+                # fetch in background
+                def fetch_avatar(u):
+                    rr = requests.get(u, headers={"User-Agent": USER_AGENT}, timeout=5)
+                    rr.raise_for_status()
+                    return rr.content
+                worker = Worker(fetch_avatar, self.channel_avatar_url)
+                def done(res):
+                    if not isinstance(res, Exception):
+                        thumbnail_cache[self.channel_avatar_url] = res
+                        px = QPixmap()
+                        px.loadFromData(res)
+                        px = px.scaled(48,48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        self.channel_avatar_label.setPixmap(px)
+                worker.signals.finished.connect(done)
+                self.threadpool.start(worker)
+        else:
+            self.channel_avatar_label.setStyleSheet("background-color: #ccc;")
+
+        # If user clicks the channel => channel page
+        def on_channel_clicked(_):
+            self.console_output.append(f"Channel clicked: {self.channel_name}")
+            self.show_channel_page()
+        self.channel_name_label.mousePressEvent = on_channel_clicked
+        self.channel_avatar_label.mousePressEvent = on_channel_clicked
 
     # ------------------
-    # mpv playback
-    def launch_mpv_merged(self, quality_label):
+    # Launch mpv
+    def launch_mpv_merged(self, quality_label, start_time=0.0):
         if not self.current_video_url:
             self.console_output.append("No URL to play.")
             return
@@ -472,14 +835,24 @@ class ModernYouTubeClient(QMainWindow):
             "--input-ipc-server=/tmp/mpvsocket",
             self.current_video_url
         ]
+        if start_time > 0:
+            mpv_args.insert(0, f"--start={start_time}")
         if not self.is_detached:
-            # embed
             wid = str(int(self.mpv_playback_widget.winId()))
             mpv_args.insert(0, f"--wid={wid}")
         self.kill_mpv()
-        self.console_output.append(f"Launching mpv with {quality_label} => {mpv_format}")
+        self.console_output.append(f"Launching mpv with '{quality_label}' at {start_time:.1f}s")
         self.player_process = QProcess(self)
         self.player_process.start("mpv", mpv_args)
+
+    def on_quality_changed(self):
+        """When user picks a new quality, mid-playback switch if a video is playing."""
+        if not self.current_video_url or not self.player_process:
+            return
+        time_pos = get_current_playback_time("/tmp/mpvsocket")
+        new_q = self.quality_combo.currentText()
+        self.console_output.append(f"Switching quality to {new_q} at {time_pos:.1f}s")
+        self.launch_mpv_merged(new_q, start_time=time_pos)
 
     def kill_mpv(self):
         os_type = platform.system()
@@ -490,34 +863,10 @@ class ModernYouTubeClient(QMainWindow):
         elif os_type == "Darwin":
             os.system("pkill mpv")
         else:
-            self.console_output.append("Unsupported OS for kill mpv.")
+            self.console_output.append("Unsupported OS for killing mpv.")
 
-    def toggle_detach(self):
-        self.is_detached = not self.is_detached
-        if self.is_detached:
-            self.detach_button.setText("Attach")
-            self.console_output.append("Now in detached mode.")
-        else:
-            self.detach_button.setText("Detach")
-            self.console_output.append("Now in embedded mode.")
-        # If something is playing, relaunch
-        if self.current_video_url and self.player_process:
-            self.launch_mpv_merged(self.quality_combo.currentText())
-
-    def toggle_fullscreen(self):
-        # Send IPC command to mpv to cycle fullscreen
-        try:
-            cmd = b'cycle fullscreen\n'
-            # We can do this only if we have an IPC socket
-            if self.player_process:
-                # Not directly accessible, so let's open /tmp/mpvsocket
-                with open("/tmp/mpvsocket", "wb") as f:
-                    f.write(cmd)
-            self.console_output.append("Toggled fullscreen via IPC.")
-        except Exception as e:
-            self.console_output.append(f"Fullscreen toggle failed: {e}")
-
-    # For separate streams
+    # ------------------
+    # watch separate streams
     def watch_separate_streams(self):
         if not self.current_info:
             self.console_output.append("No video info for separate streams.")
@@ -531,10 +880,9 @@ class ModernYouTubeClient(QMainWindow):
             if f.get("vcodec") == "none" and not audio_only_url:
                 audio_only_url = f["url"]
         if not video_only_url or not audio_only_url:
-            self.console_output.append("No separate video/audio => fallback merged.")
+            self.console_output.append("No separate streams found; fallback merged.")
             self.launch_mpv_merged(self.quality_combo.currentText())
             return
-
         self.kill_mpv()
         video_ipc = "/tmp/mpv_video"
         audio_ipc = "/tmp/mpv_audio"
@@ -549,8 +897,7 @@ class ModernYouTubeClient(QMainWindow):
         if not self.is_detached:
             wid = str(int(self.mpv_playback_widget.winId()))
             video_args.insert(0, f"--wid={wid}")
-
-        self.console_output.append("Launching separate mpv processes.")
+        self.console_output.append("Launching separate mpv processes for video and audio.")
         self.video_process = QProcess(self)
         self.video_process.start("mpv", video_args)
         self.audio_process = QProcess(self)
@@ -558,10 +905,31 @@ class ModernYouTubeClient(QMainWindow):
         self.sync_timer.start(1000)
 
     def check_sync(self):
-        self.console_output.append("Stub sync check (separate streams).")
+        self.console_output.append("Sync check (stub).")
 
     # ------------------
-    # Dark Mode
+    # Detach, Fullscreen, Dark Mode
+    def toggle_detach(self):
+        self.is_detached = not self.is_detached
+        if self.is_detached:
+            self.detach_button.setText("Attach")
+            self.console_output.append("Now in detached mode.")
+        else:
+            self.detach_button.setText("Detach")
+            self.console_output.append("Now in embedded mode.")
+        if self.current_video_url and self.player_process is not None:
+            time_pos = get_current_playback_time("/tmp/mpvsocket")
+            self.launch_mpv_merged(self.quality_combo.currentText(), start_time=time_pos)
+
+    def toggle_fullscreen(self):
+        try:
+            cmd = b'cycle fullscreen\n'
+            with open("/tmp/mpvsocket", "wb") as f:
+                f.write(cmd)
+            self.console_output.append("Fullscreen toggled via IPC.")
+        except Exception as e:
+            self.console_output.append(f"Fullscreen toggle failed: {e}")
+
     def toggle_dark_mode(self):
         palette = self.palette()
         if palette.color(QPalette.Window) == QColor(255, 255, 255):

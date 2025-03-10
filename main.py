@@ -1,33 +1,83 @@
+#!/usr/bin/env python3
 import sys
 import os
 import json
 import asyncio
-import platform
 import socket
+import time  # For retry delays
 import yt_dlp
 from bs4 import BeautifulSoup
 
 from PyQt5.QtCore import (
-    QProcess, Qt, QThreadPool, QRunnable, pyqtSlot, QObject, pyqtSignal,
-    QSize, QTimer
+    QProcess, Qt, QThreadPool, QRunnable, pyqtSlot, QObject, pyqtSignal, QTimer
 )
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QScrollArea, QGridLayout, QLineEdit, QPushButton, QLabel, QTextEdit,
-    QComboBox, QStackedWidget, QSizePolicy
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
+    QGridLayout, QLineEdit, QPushButton, QLabel, QTextEdit, QComboBox,
+    QStackedWidget, QSizePolicy, QProgressBar
 )
-from PyQt5.QtGui import QPixmap, QIcon, QPalette, QColor, QFont
+from PyQt5.QtGui import QPixmap, QPalette, QColor, QFont
 
 import requests
 import requests_cache
+import pyppeteer  # For scraping comments headlessly
 
 # Enable disk caching for HTTP requests (expires after 1 day)
 requests_cache.install_cache('youtube_cache', expire_after=86400)
 
-#################################
-# Helper functions for mpv IPC fullscreen handling
+
+# -----------------------------------------------------------------------------
+# HEADLESS COMMENT SCRAPING
+async def scrape_comments_headless(video_url, scroll_count=1, existing_ids=None, max_comments=50):
+    if existing_ids is None:
+        existing_ids = set()
+    browser = await pyppeteer.launch(
+        headless=True,
+        args=["--no-sandbox"],
+        handleSIGINT=False,
+        handleSIGTERM=False,
+        handleSIGHUP=False
+    )
+    page = await browser.newPage()
+    await page.goto(video_url, {"waitUntil": "networkidle2"})
+    try:
+        await page.waitForSelector("#contents.ytd-item-section-renderer", timeout=10000)
+    except Exception:
+        pass
+    total_scrolls = 3 * scroll_count
+    for _ in range(total_scrolls):
+        await page.evaluate("() => { window.scrollBy(0, 1500); }")
+        await asyncio.sleep(2)
+    html = await page.content()
+    await browser.close()
+    soup = BeautifulSoup(html, "html.parser")
+    blocks = soup.select("ytd-comment-thread-renderer")
+    new_comments = []
+    for block in blocks:
+        user_div = block.select_one("#author-text")
+        user = user_div.get_text(strip=True) if user_div else "Unknown"
+        pic_div = block.select_one("#author-thumbnail img")
+        pic_url = pic_div["src"] if pic_div and pic_div.has_attr("src") else None
+        text_div = block.select_one("#content-text")
+        text = text_div.get_text(strip=True) if text_div else ""
+        dup_key = (user, text)
+        if dup_key in existing_ids:
+            continue
+        existing_ids.add(dup_key)
+        new_comments.append({
+            "username": user,
+            "avatar": pic_url,
+            "text": text
+        })
+    return new_comments
+
+
+# -----------------------------------------------------------------------------
+# MPV UTILS
 def get_fullscreen_status(ipc_path="/tmp/mpvsocket"):
     try:
+        if not os.path.exists(ipc_path):
+            return False
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(ipc_path)
         cmd = {"command": ["get_property", "fullscreen"]}
@@ -48,6 +98,7 @@ def get_fullscreen_status(ipc_path="/tmp/mpvsocket"):
         print("Error getting fullscreen status:", e)
     return False
 
+
 def set_fullscreen_property(fullscreen, ipc_path="/tmp/mpvsocket"):
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -58,15 +109,49 @@ def set_fullscreen_property(fullscreen, ipc_path="/tmp/mpvsocket"):
     except Exception as e:
         print("Error setting fullscreen property:", e)
 
-#################################
-# Hard-coded user agent (Chromium 132)
+
+def get_current_playback_time(ipc_path="/tmp/mpvsocket"):
+    if not os.path.exists(ipc_path):
+        return 0.0
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(ipc_path)
+        cmd = {"command": ["get_property", "time-pos"]}
+        sock.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
+        response = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+            if b"\n" in chunk:
+                break
+        sock.close()
+        data = json.loads(response.decode("utf-8").strip())
+        if "data" in data:
+            return float(data["data"])
+    except Exception as e:
+        print("Error getting playback time:", e)
+    return 0.0
+
+
+def safe_get_current_playback_time(ipc_path="/tmp/mpvsocket", attempts=5, delay=0.2):
+    for _ in range(attempts):
+        if os.path.exists(ipc_path):
+            try:
+                return get_current_playback_time(ipc_path)
+            except OSError:
+                pass
+        time.sleep(delay)
+    return 0.0
+
+
+# -----------------------------------------------------------------------------
+# Session and Thumbnail Helpers
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
 )
-
-#################################
-# Global persistent session with compression and caching headers.
 session = requests.Session()
 session.headers.update({
     "User-Agent": USER_AGENT,
@@ -74,15 +159,13 @@ session.headers.update({
     "Cache-Control": "max-age=86400"
 })
 
-#################################
-# Helper to reduce thumbnail resolution (saves bandwidth)
+
 def get_low_res_thumbnail(url):
     if "maxresdefault" in url:
         return url.replace("maxresdefault", "mqdefault")
     return url
 
-#################################
-# Format mapping for merged playback
+
 FORMAT_MAPPING = {
     "2k":       "bestvideo[height>=1440]+bestaudio/best",
     "1080p60":  "bestvideo[height>=1080][fps>=60]+bestaudio/best",
@@ -94,33 +177,29 @@ FORMAT_MAPPING = {
     "144p":     "bestvideo[height>=144][height<240]+bestaudio/best",
 }
 ALL_QUALITIES = list(FORMAT_MAPPING.keys())
-
-#################################
-# Global caches
+SEARCH_HISTORY_FILE = "search_history.json"
+LOG_FILE = "mpvlog.txt"
 search_cache = {}
 thumbnail_cache = {}
 extraction_cache = {}
 channel_videos_cache = {}
 
-SEARCH_HISTORY_FILE = "search_history.json"
-SETTINGS_FILE = "settings.json"
-LOG_FILE = "mpvlog.txt"
 
-#################################
 def load_search_history():
     if os.path.exists(SEARCH_HISTORY_FILE):
         with open(SEARCH_HISTORY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {"queries": []}
 
-def save_search_history(query):
-    history = load_search_history()
-    history["queries"].append(query)
-    history["queries"] = history["queries"][-50:]
-    with open(SEARCH_HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
 
-#################################
+def save_search_history(query):
+    hist = load_search_history()
+    hist["queries"].append(query)
+    hist["queries"] = hist["queries"][-50:]
+    with open(SEARCH_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(hist, f, ensure_ascii=False, indent=2)
+
+
 def available_buckets(info):
     formats = info.get("formats", [])
     bucket_avail = set()
@@ -146,30 +225,7 @@ def available_buckets(info):
     result = [q for q in ALL_QUALITIES if q in bucket_avail]
     return result if result else ["360p"]
 
-def get_current_playback_time(ipc_path="/tmp/mpvsocket"):
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(ipc_path)
-        cmd = {"command": ["get_property", "time-pos"]}
-        sock.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
-        response = b""
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            response += chunk
-            if b"\n" in chunk:
-                break
-        sock.close()
-        data = json.loads(response.decode("utf-8").strip())
-        if "data" in data:
-            return float(data["data"])
-    except Exception as e:
-        print("Error getting playback time:", e)
-    return 0.0
 
-#################################
-# Channel scraping using global session
 def scrape_channel_avatar(channel_url):
     if not channel_url:
         return None
@@ -184,10 +240,13 @@ def scrape_channel_avatar(channel_url):
         print("scrape_channel_avatar error:", e)
     return None
 
+
 def get_channel_videos(channel_url, max_results=20):
     if not channel_url:
         return []
     cache_key = (channel_url, max_results)
+    if ("youtube.com/@" in channel_url or "youtube.com/channel/" in channel_url) and "/videos" not in channel_url:
+        channel_url += "/videos"
     if cache_key in channel_videos_cache:
         return channel_videos_cache[cache_key]
     opts = {
@@ -221,8 +280,7 @@ def get_channel_videos(channel_url, max_results=20):
     channel_videos_cache[cache_key] = results
     return results
 
-#################################
-# Searching with caching using yt_dlp
+
 def search_youtube(query, max_results=20):
     cache_key = (query, max_results)
     if cache_key in search_cache:
@@ -252,8 +310,7 @@ def search_youtube(query, max_results=20):
     search_cache[cache_key] = results
     return results
 
-#################################
-# Extraction with caching
+
 def extract_formats(video_url, cookies_file=None):
     cache_key = (video_url, cookies_file)
     if cache_key in extraction_cache:
@@ -272,10 +329,12 @@ def extract_formats(video_url, cookies_file=None):
     extraction_cache[cache_key] = info
     return info
 
-#################################
-# Worker for background tasks
+
+# -----------------------------------------------------------------------------
+# Worker Classes
 class WorkerSignals(QObject):
     finished = pyqtSignal(object)
+
 
 class Worker(QRunnable):
     def __init__(self, fn, *args, **kwargs):
@@ -292,13 +351,91 @@ class Worker(QRunnable):
         except Exception as e:
             self.signals.finished.emit(e)
 
-#################################
-# Main Application
+
+async def get_cookies_headless(video_url):
+    return []
+
+
+def save_cookies_to_file(cookies, path):
+    pass
+
+
+# -----------------------------------------------------------------------------
+# Create a vertically scrollable playback container
+def create_playback_container(parent):
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(10)
+    # Video player (mpv) at top with increased minimum height
+    mpv_widget = QWidget()
+    mpv_widget.setStyleSheet("background-color: #333;")
+    mpv_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    mpv_widget.setMinimumHeight(720)
+    layout.addWidget(mpv_widget)
+    parent.mpv_playback_widget = mpv_widget
+    # Info container
+    info_container = QWidget()
+    info_layout = QVBoxLayout(info_container)
+    info_layout.setSpacing(5)
+    info_layout.setContentsMargins(10, 10, 10, 10)
+    parent.video_title_label = QLabel("Video Title Here")
+    parent.video_title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+    info_layout.addWidget(parent.video_title_label)
+    channel_row = QWidget()
+    ch_layout = QHBoxLayout(channel_row)
+    ch_layout.setSpacing(10)
+    ch_layout.setContentsMargins(0, 0, 0, 0)
+    parent.channel_avatar_label = QLabel()
+    parent.channel_avatar_label.setFixedSize(48, 48)
+    parent.channel_avatar_label.setStyleSheet("background-color: #ccc;")
+    parent.channel_name_label = QLabel("Channel Name")
+    ch_font = QFont()
+    ch_font.setPointSize(13)
+    ch_font.setBold(True)
+    parent.channel_name_label.setFont(ch_font)
+    ch_layout.addWidget(parent.channel_avatar_label)
+    ch_layout.addWidget(parent.channel_name_label)
+    info_layout.addWidget(channel_row)
+    desc_label = QLabel("Video description goes here...")
+    desc_label.setWordWrap(True)
+    parent.video_desc_label = desc_label
+    info_layout.addWidget(desc_label)
+    comments_header = QLabel("Comments")
+    comments_header.setStyleSheet("font-size: 14px; font-weight: bold;")
+    info_layout.addWidget(comments_header)
+    comments_container = QWidget()
+    comments_layout = QVBoxLayout(comments_container)
+    comments_layout.setSpacing(5)
+    comments_layout.setContentsMargins(0, 0, 0, 0)
+    parent.comments_layout = comments_layout
+    info_layout.addWidget(comments_container)
+    parent.load_more_button = QPushButton("Load More Comments")
+    parent.load_more_button.clicked.connect(parent.on_load_more_comments)
+    info_layout.addWidget(parent.load_more_button, alignment=Qt.AlignLeft)
+    layout.addWidget(info_container)
+    suggested_header = QLabel("Suggested Videos")
+    suggested_header.setStyleSheet("font-size: 14px; font-weight: bold;")
+    layout.addWidget(suggested_header)
+    suggested_container = QWidget()
+    suggested_layout = QVBoxLayout(suggested_container)
+    suggested_layout.setSpacing(10)
+    suggested_layout.setContentsMargins(10, 10, 10, 10)
+    parent.suggested_layout = suggested_layout
+    layout.addWidget(suggested_container)
+    scroll_area = QScrollArea()
+    scroll_area.setWidgetResizable(True)
+    scroll_area.setWidget(container)
+    scroll_area.verticalScrollBar().valueChanged.connect(parent.on_playback_scroll)
+    return scroll_area
+
+
+# -----------------------------------------------------------------------------
+# Main Application Class
 class ModernYouTubeClient(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BorgorTube")
-        self.resize(1280, 800)
         self.threadpool = QThreadPool()
         self.threadpool.setMaxThreadCount(4)
         self.current_info = None
@@ -314,42 +451,37 @@ class ModernYouTubeClient(QMainWindow):
         self.video_title = None
         self.video_description = None
         self.low_latency_mode = False
-        # Timer to monitor fullscreen state
         self.fullscreen_timer = QTimer()
         self.fullscreen_timer.timeout.connect(self.check_fullscreen_mode)
         self.sync_timer = QTimer()
         self.sync_timer.timeout.connect(self.check_sync)
+        self.comment_scroll_count = 1
+        self.comment_existing_ids = set()
+        # New flag to prevent multiple simultaneous comment loads
+        self.comments_loading = False
         self.build_ui()
 
-    # ------------------
     def build_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_vlayout = QVBoxLayout(central_widget)
         main_vlayout.setContentsMargins(0, 0, 0, 0)
         main_vlayout.setSpacing(0)
+        # Replace spinner with a small progress bar (indeterminate mode)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(20)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.hide()
+        main_vlayout.addWidget(self.progress_bar)
         self.top_bar = self.create_top_bar()
         main_vlayout.addWidget(self.top_bar, 0)
         self.stacked_widget = QStackedWidget()
         self.home_page = self.create_home_page()
-        self.playback_page = QWidget()
-        self.playback_layout = QHBoxLayout(self.playback_page)
-        self.playback_layout.setContentsMargins(10, 10, 10, 10)
-        self.playback_layout.setSpacing(10)
-        self.playback_left_container = self.create_playback_left_container()
-        self.playback_layout.addWidget(self.playback_left_container, 2)
-        self.suggested_scroll = QScrollArea()
-        self.suggested_scroll.setWidgetResizable(True)
-        self.suggested_container = QWidget()
-        self.suggested_layout = QVBoxLayout(self.suggested_container)
-        self.suggested_layout.setSpacing(10)
-        self.suggested_layout.setContentsMargins(10, 10, 10, 10)
-        self.suggested_scroll.setWidget(self.suggested_container)
-        self.playback_layout.addWidget(self.suggested_scroll, 1)
+        self.playback_page = create_playback_container(self)
         self.channel_page = self.create_channel_page()
-        self.stacked_widget.addWidget(self.home_page)   # index 0
-        self.stacked_widget.addWidget(self.playback_page) # index 1
-        self.stacked_widget.addWidget(self.channel_page)  # index 2
+        self.stacked_widget.addWidget(self.home_page)      # index 0
+        self.stacked_widget.addWidget(self.playback_page)  # index 1
+        self.stacked_widget.addWidget(self.channel_page)   # index 2
         main_vlayout.addWidget(self.stacked_widget, 1)
         self.console_output = QTextEdit()
         self.console_output.setReadOnly(True)
@@ -357,7 +489,6 @@ class ModernYouTubeClient(QMainWindow):
         main_vlayout.addWidget(self.console_output, 0)
         self.stacked_widget.setCurrentIndex(0)
 
-    # ------------------
     def create_top_bar(self):
         top_widget = QWidget()
         layout = QHBoxLayout(top_widget)
@@ -390,53 +521,6 @@ class ModernYouTubeClient(QMainWindow):
         self.low_latency_button.toggled.connect(self.toggle_low_latency_mode)
         layout.addWidget(self.low_latency_button)
         return top_widget
-
-    def toggle_low_latency_mode(self, checked):
-        self.low_latency_mode = checked
-        mode = "enabled" if checked else "disabled"
-        self.console_output.append(f"Low latency mode {mode}.")
-        if self.current_video_url and self.player_process is not None:
-            time_pos = get_current_playback_time("/tmp/mpvsocket")
-            self.launch_mpv_merged(self.quality_combo.currentText(), start_time=time_pos)
-
-    def toggle_fullscreen(self):
-        # If not detached, detach first.
-        if not self.is_detached:
-            self.is_detached = True
-            self.console_output.append("Detaching for fullscreen mode.")
-            time_pos = get_current_playback_time("/tmp/mpvsocket")
-            self.launch_mpv_merged(self.quality_combo.currentText(), start_time=time_pos)
-        # Send fullscreen command and start monitoring timer.
-        set_fullscreen_property(True)
-        self.console_output.append("Fullscreen command sent.")
-        self.fullscreen_timer.start(1000)
-
-    def check_fullscreen_mode(self):
-        if self.player_process is None or self.player_process.state() != QProcess.Running:
-            self.console_output.append("mpv process not running. Re-embedding video.")
-            self.is_detached = False
-            self.fullscreen_timer.stop()
-            time_pos = get_current_playback_time("/tmp/mpvsocket")
-            self.launch_mpv_merged(self.quality_combo.currentText(), start_time=time_pos)
-            return
-        if not get_fullscreen_status():
-            self.console_output.append("mpv not in fullscreen. Forcing fullscreen mode.")
-            set_fullscreen_property(True)
-
-    def go_back(self):
-        idx = self.stacked_widget.currentIndex()
-        if idx == 2:
-            if self.current_video_url and self.player_process:
-                self.stacked_widget.setCurrentIndex(1)
-                self.console_output.append("Back to playback from channel page.")
-            else:
-                self.stacked_widget.setCurrentIndex(0)
-                self.console_output.append("Back to home from channel page.")
-        elif idx == 1:
-            self.stacked_widget.setCurrentIndex(0)
-            self.console_output.append("Back to home from playback page.")
-        else:
-            self.console_output.append("Already on home page.")
 
     def create_home_page(self):
         page = QWidget()
@@ -515,54 +599,6 @@ class ModernYouTubeClient(QMainWindow):
         thumb_label.mousePressEvent = on_thumb_click
         title_label.mousePressEvent = on_thumb_click
         return w
-
-    def create_playback_left_container(self):
-        container = QWidget()
-        vlayout = QVBoxLayout(container)
-        vlayout.setContentsMargins(0, 0, 0, 0)
-        vlayout.setSpacing(10)
-        self.mpv_playback_widget = QWidget()
-        self.mpv_playback_widget.setStyleSheet("background-color: #333;")
-        self.mpv_playback_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.mpv_playback_widget.setMinimumHeight(400)
-        vlayout.addWidget(self.mpv_playback_widget, 2)
-        info_container = QWidget()
-        info_layout = QVBoxLayout(info_container)
-        info_layout.setSpacing(5)
-        self.video_title_label = QLabel("Video Title Here")
-        self.video_title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
-        info_layout.addWidget(self.video_title_label, 0)
-        channel_row = QWidget()
-        channel_hlayout = QHBoxLayout(channel_row)
-        channel_hlayout.setSpacing(10)
-        channel_hlayout.setContentsMargins(0, 0, 0, 0)
-        self.channel_avatar_label = QLabel()
-        self.channel_avatar_label.setFixedSize(48, 48)
-        self.channel_avatar_label.setStyleSheet("background-color: #ccc;")
-        self.channel_name_label = QLabel("Channel Name")
-        ch_font = QFont()
-        ch_font.setPointSize(13)
-        ch_font.setBold(True)
-        self.channel_name_label.setFont(ch_font)
-        channel_hlayout.addWidget(self.channel_avatar_label, 0, Qt.AlignVCenter | Qt.AlignLeft)
-        channel_hlayout.addWidget(self.channel_name_label, 0, Qt.AlignVCenter | Qt.AlignLeft)
-        channel_row.setLayout(channel_hlayout)
-        info_layout.addWidget(channel_row, 0)
-        desc_scroll = QScrollArea()
-        desc_scroll.setWidgetResizable(True)
-        desc_widget = QWidget()
-        desc_layout = QVBoxLayout(desc_widget)
-        desc_layout.setContentsMargins(0, 0, 0, 0)
-        self.video_desc_label = QLabel("Video description goes here. Potentially very long.")
-        self.video_desc_label.setWordWrap(True)
-        desc_layout.addWidget(self.video_desc_label, 1)
-        desc_widget.setLayout(desc_layout)
-        desc_scroll.setWidget(desc_widget)
-        desc_scroll.setFixedHeight(200)
-        info_layout.addWidget(desc_scroll)
-        info_container.setLayout(info_layout)
-        vlayout.addWidget(info_container, 1)
-        return container
 
     def create_channel_page(self):
         page = QWidget()
@@ -703,15 +739,20 @@ class ModernYouTubeClient(QMainWindow):
         return w
 
     def do_search(self):
+        self.show_loading()
         query = self.search_field.text().strip()
         if not query:
             self.console_output.append("No search query.")
+            self.hide_loading()
             return
         self.console_output.append(f"Searching: {query}")
         save_search_history(query)
         self.populate_home_grid([])
         worker = Worker(search_youtube, query, 20)
-        worker.signals.finished.connect(self.on_search_results)
+        def done(res):
+            self.hide_loading()
+            self.on_search_results(res)
+        worker.signals.finished.connect(done)
         self.threadpool.start(worker)
 
     def on_search_results(self, result):
@@ -723,9 +764,13 @@ class ModernYouTubeClient(QMainWindow):
         self.stacked_widget.setCurrentIndex(0)
 
     def start_extraction(self, url):
+        self.show_loading()
         self.console_output.append(f"Extracting info for: {url}")
         worker = Worker(self.extract_with_fallback, url)
-        worker.signals.finished.connect(self.on_extraction_done)
+        def done(res):
+            self.hide_loading()
+            self.on_extraction_done(res)
+        worker.signals.finished.connect(done)
         self.threadpool.start(worker)
         self.stacked_widget.setCurrentIndex(1)
 
@@ -768,10 +813,20 @@ class ModernYouTubeClient(QMainWindow):
         if self.qualities_available:
             self.quality_combo.setCurrentIndex(0)
         self.update_video_info_fields()
+        self.comment_scroll_count = 1
+        self.comment_existing_ids = set()
+        for i in reversed(range(self.comments_layout.count())):
+            item = self.comments_layout.itemAt(i)
+            if item and item.widget():
+                item.widget().setParent(None)
         best = self.qualities_available[0] if self.qualities_available else "360p"
         self.launch_mpv_merged(best)
         self.console_output.append("Available qualities: " + ", ".join(self.qualities_available))
         self.update_suggested_videos()
+        if self.current_video_url:
+            self.show_loading()
+            # Start loading comments with our flag check
+            self.on_load_more_comments()
 
     def update_video_info_fields(self):
         self.video_title_label.setText(self.video_title or "Untitled")
@@ -807,6 +862,16 @@ class ModernYouTubeClient(QMainWindow):
         self.channel_name_label.mousePressEvent = on_channel_clicked
         self.channel_avatar_label.mousePressEvent = on_channel_clicked
 
+    def on_comments_fetched(self, result):
+        if isinstance(result, Exception):
+            self.console_output.append(f"Error fetching comments: {result}")
+            return
+        if not result:
+            self.console_output.append("No comments or restricted.")
+            return
+        for c in result:
+            self.add_comment_widget(c)
+
     def update_suggested_videos(self):
         for i in reversed(range(self.suggested_layout.count())):
             item = self.suggested_layout.itemAt(i)
@@ -836,10 +901,10 @@ class ModernYouTubeClient(QMainWindow):
         if url:
             low_res_url = get_low_res_thumbnail(url)
             if low_res_url in thumbnail_cache:
-                px = QPixmap()
-                px.loadFromData(thumbnail_cache[low_res_url])
-                px = px.scaled(120, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                thumb_label.setPixmap(px)
+                pix = QPixmap()
+                pix.loadFromData(thumbnail_cache[low_res_url])
+                pix = pix.scaled(120, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                thumb_label.setPixmap(pix)
             else:
                 def fetch_thumb(u):
                     r = session.get(u, timeout=5)
@@ -849,10 +914,10 @@ class ModernYouTubeClient(QMainWindow):
                 def done(res):
                     if not isinstance(res, Exception):
                         thumbnail_cache[low_res_url] = res
-                        px = QPixmap()
-                        px.loadFromData(res)
-                        px = px.scaled(120, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                        thumb_label.setPixmap(px)
+                        pix = QPixmap()
+                        pix.loadFromData(res)
+                        pix = pix.scaled(120, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        thumb_label.setPixmap(pix)
                 worker.signals.finished.connect(done)
                 self.threadpool.start(worker)
         text_label = QLabel(video_data.get("title", "Untitled"))
@@ -867,18 +932,17 @@ class ModernYouTubeClient(QMainWindow):
         text_label.mousePressEvent = on_thumb_click
         return w
 
-    def launch_mpv_merged(self, quality_label, start_time=0.0):
+    def launch_mpv_merged(self, quality_label, start_time=0.0, force_fullscreen=False):
         if not self.current_video_url:
             self.console_output.append("No URL to play.")
             return
         mpv_format = FORMAT_MAPPING.get(quality_label, "best")
-        # Build base arguments without buffering options yet.
         mpv_args = [
             "--osc",
             "--demuxer-thread=yes",
+            "--hwdec=no",  # Disable hardware decoding to reduce segfaults
             f"--ytdl-format={mpv_format}",
             f"--log-file={LOG_FILE}",
-            "--msg-level=all=v",
             "--input-ipc-server=/tmp/mpvsocket",
             self.current_video_url
         ]
@@ -887,7 +951,6 @@ class ModernYouTubeClient(QMainWindow):
         if not self.is_detached:
             wid = str(int(self.mpv_playback_widget.winId()))
             mpv_args.insert(0, f"--wid={wid}")
-        # If low latency mode is enabled, use minimal buffering; else, use full buffering.
         if self.low_latency_mode:
             low_latency_options = [
                 "--cache=no",
@@ -903,15 +966,21 @@ class ModernYouTubeClient(QMainWindow):
                 "--demuxer-readahead-secs=10"
             ]
             mpv_args = buffering_options + mpv_args
+        mpv_args.append("--panscan=1.0")
+        if force_fullscreen:
+            mpv_args.insert(0, "--fullscreen")
         self.kill_mpv()
-        self.console_output.append(f"Launching mpv with '{quality_label}' at {start_time:.1f}s")
+        self.console_output.append(
+            f"Launching mpv with '{quality_label}' at {start_time:.1f}s "
+            f"(force_fullscreen={force_fullscreen}, detached={self.is_detached})"
+        )
         self.player_process = QProcess(self)
         self.player_process.start("mpv", mpv_args)
 
     def on_quality_changed(self):
         if not self.current_video_url or not self.player_process:
             return
-        time_pos = get_current_playback_time("/tmp/mpvsocket")
+        time_pos = safe_get_current_playback_time("/tmp/mpvsocket")
         new_q = self.quality_combo.currentText()
         self.console_output.append(f"Switching quality to {new_q} at {time_pos:.1f}s")
         self.launch_mpv_merged(new_q, start_time=time_pos)
@@ -931,63 +1000,17 @@ class ModernYouTubeClient(QMainWindow):
             self.audio_process = None
 
     def watch_separate_streams(self):
-        if not self.current_info:
-            self.console_output.append("No video info for separate streams.")
-            return
-        formats = self.current_info.get("formats", [])
-        video_only_url = None
-        audio_only_url = None
-        for f in formats:
-            if f.get("acodec") == "none" and not video_only_url:
-                video_only_url = f["url"]
-            if f.get("vcodec") == "none" and not audio_only_url:
-                audio_only_url = f["url"]
-        if not video_only_url or not audio_only_url:
-            self.console_output.append("No separate streams found; fallback merged.")
-            self.launch_mpv_merged(self.quality_combo.currentText())
-            return
-        self.kill_mpv()
-        video_ipc = "/tmp/mpv_video"
-        audio_ipc = "/tmp/mpv_audio"
-        video_args = [
-            "--no-audio", "--osc", "--cache=yes", "--demuxer-thread=yes",
-            f"--input-ipc-server={video_ipc}", video_only_url
-        ]
-        audio_args = [
-            "--no-video", "--osc", "--cache=yes", "--demuxer-thread=yes",
-            f"--input-ipc-server={audio_ipc}", audio_only_url
-        ]
-        if not self.is_detached:
-            wid = str(int(self.mpv_playback_widget.winId()))
-            video_args.insert(0, f"--wid={wid}")
-        self.console_output.append("Launching separate mpv processes for video and audio.")
-        self.video_process = QProcess(self)
-        self.video_process.start("mpv", video_args)
-        self.audio_process = QProcess(self)
-        self.audio_process.start("mpv", audio_args)
-        self.sync_timer.start(1000)
+        self.console_output.append("Separate streams not implemented here.")
 
     def check_sync(self):
         self.console_output.append("Sync check (stub).")
-
-    def toggle_detach(self):
-        self.is_detached = not self.is_detached
-        if self.is_detached:
-            self.detach_button.setText("Attach")
-            self.console_output.append("Now in detached mode.")
-        else:
-            self.detach_button.setText("Detach")
-            self.console_output.append("Now in embedded mode.")
-        if self.current_video_url and self.player_process is not None:
-            time_pos = get_current_playback_time("/tmp/mpvsocket")
-            self.launch_mpv_merged(self.quality_combo.currentText(), start_time=time_pos)
 
     def toggle_fullscreen_manual(self):
         try:
             cmd = b'cycle fullscreen\n'
             with open("/tmp/mpvsocket", "wb") as f:
                 f.write(cmd)
-            self.console_output.append("Fullscreen toggled via IPC.")
+            self.console_output.append("Fullscreen toggled via IPC (manual).")
         except Exception as e:
             self.console_output.append(f"Fullscreen toggle failed: {e}")
 
@@ -1003,11 +1026,168 @@ class ModernYouTubeClient(QMainWindow):
             self.console_output.setStyleSheet("background-color: white; color: black;")
         self.setPalette(palette)
 
-def main():
+    def toggle_low_latency_mode(self, checked):
+        self.low_latency_mode = checked
+        mode = "enabled" if checked else "disabled"
+        self.console_output.append(f"Low latency mode {mode}.")
+        if self.current_video_url and self.player_process is not None:
+            time_pos = safe_get_current_playback_time("/tmp/mpvsocket")
+            self.launch_mpv_merged(self.quality_combo.currentText(), start_time=time_pos)
+
+    def toggle_detach(self):
+        self.is_detached = not self.is_detached
+        if self.is_detached:
+            self.detach_button.setText("Attach")
+            self.console_output.append("Now in detached mode.")
+        else:
+            self.detach_button.setText("Detach")
+            self.console_output.append("Now in embedded mode.")
+        time_pos = safe_get_current_playback_time("/tmp/mpvsocket")
+        self.kill_mpv()
+        self.launch_mpv_merged(self.quality_combo.currentText(), start_time=time_pos)
+
+    def toggle_fullscreen(self):
+        if not self.is_detached:
+            self.is_detached = True
+            self.console_output.append("Detaching for fullscreen mode.")
+            time_pos = safe_get_current_playback_time("/tmp/mpvsocket")
+            self.launch_mpv_merged(self.quality_combo.currentText(), start_time=time_pos)
+        self.console_output.append("Launching mpv in fullscreen mode.")
+        time_pos = safe_get_current_playback_time("/tmp/mpvsocket")
+        self.launch_mpv_merged(
+            self.quality_combo.currentText(), start_time=time_pos, force_fullscreen=True
+        )
+        self.fullscreen_timer.start(1000)
+
+    def check_fullscreen_mode(self):
+        if self.player_process is None or self.player_process.state() != QProcess.Running:
+            self.console_output.append("mpv process not running. Re-embedding video.")
+            self.is_detached = False
+            self.fullscreen_timer.stop()
+            time_pos = safe_get_current_playback_time("/tmp/mpvsocket")
+            self.launch_mpv_merged(self.quality_combo.currentText(), start_time=time_pos)
+            return
+        if not get_fullscreen_status():
+            self.console_output.append("mpv not in fullscreen. Forcing fullscreen mode.")
+            set_fullscreen_property(True)
+
+    def go_back(self):
+        idx = self.stacked_widget.currentIndex()
+        if idx == 2:
+            if self.current_video_url and self.player_process:
+                self.stacked_widget.setCurrentIndex(1)
+                self.console_output.append("Back to playback from channel page.")
+            else:
+                self.stacked_widget.setCurrentIndex(0)
+                self.console_output.append("Back to home from channel page.")
+        elif idx == 1:
+            self.stacked_widget.setCurrentIndex(0)
+            self.console_output.append("Back to home from playback page.")
+        else:
+            self.console_output.append("Already on home page.")
+
+    def show_loading(self):
+        self.progress_bar.show()
+
+    def hide_loading(self):
+        self.progress_bar.hide()
+
+    def on_playback_scroll(self, value):
+        scroll_bar = self.sender()
+        if scroll_bar is None:
+            return
+        if value > scroll_bar.maximum() - 50:
+            # Only load if not already loading
+            if self.load_more_button.isEnabled() and not self.comments_loading:
+                self.on_load_more_comments()
+
+    # --- Optimized comment loading ---
+    def on_load_more_comments(self):
+        if not self.current_video_url:
+            return
+        if self.comments_loading:
+            return  # Prevent overlapping loads
+        self.comments_loading = True
+        self.comment_scroll_count += 1
+        self.show_loading()
+        def run_scrape():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            new_data = loop.run_until_complete(scrape_comments_headless(
+                self.current_video_url,
+                scroll_count=self.comment_scroll_count,
+                existing_ids=self.comment_existing_ids
+            ))
+            loop.close()
+            return new_data
+        worker = Worker(run_scrape)
+        worker.signals.finished.connect(self.on_more_comments_fetched)
+        self.threadpool.start(worker)
+
+    def on_more_comments_fetched(self, result):
+        self.hide_loading()
+        self.comments_loading = False  # Reset the flag
+        if isinstance(result, Exception):
+            self.console_output.append(f"Error fetching more comments: {result}")
+            return
+        if not result:
+            self.console_output.append("End of comment line.")
+            self.load_more_button.setDisabled(True)
+            self.load_more_button.setText("No more comments")
+            return
+        for c in result:
+            self.add_comment_widget(c)
+
+    def add_comment_widget(self, c):
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setSpacing(5)
+        lay.setContentsMargins(0, 0, 0, 0)
+        avatar_label = QLabel()
+        avatar_label.setFixedSize(40, 40)
+        if c["avatar"]:
+            if c["avatar"] in thumbnail_cache:
+                pix = QPixmap()
+                pix.loadFromData(thumbnail_cache[c["avatar"]])
+                pix = pix.scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                avatar_label.setPixmap(pix)
+            else:
+                def fetch_avatar(u):
+                    r = requests.get(u, timeout=5)
+                    r.raise_for_status()
+                    return r.content
+                worker = Worker(fetch_avatar, c["avatar"])
+                def done(res):
+                    if not isinstance(res, Exception):
+                        thumbnail_cache[c["avatar"]] = res
+                        pix = QPixmap()
+                        pix.loadFromData(res)
+                        pix = pix.scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        avatar_label.setPixmap(pix)
+                worker.signals.finished.connect(done)
+                self.threadpool.start(worker)
+        else:
+            avatar_label.setStyleSheet("background-color: #aaa;")
+        text_widget = QWidget()
+        text_lay = QVBoxLayout(text_widget)
+        text_lay.setSpacing(2)
+        text_lay.setContentsMargins(0, 0, 0, 0)
+        user_label = QLabel(c["username"])
+        user_font = QFont()
+        user_font.setBold(True)
+        user_label.setFont(user_font)
+        text_label = QLabel(c["text"])
+        text_label.setWordWrap(True)
+        text_lay.addWidget(user_label, 0)
+        text_lay.addWidget(text_label, 0)
+        lay.addWidget(avatar_label, 0, Qt.AlignTop)
+        lay.addWidget(text_widget, 1)
+        self.comments_layout.addWidget(w)
+
+# -----------------------------------------------------------------------------
+# MAIN ENTRY POINT
+if __name__ == "__main__":
     app = QApplication(sys.argv)
     client = ModernYouTubeClient()
     client.show()
     sys.exit(app.exec_())
-
-if __name__ == "__main__":
-    main()

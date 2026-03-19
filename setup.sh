@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # BorgorTube – One-time setup (Linux / macOS)
-# Run this once before your first launch.
+# Run this once before your first launch, OR just run ./run.sh directly
+# (it also sets up the venv on first run).
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/.venv"
+
+ok()   { echo "[OK]    $*"; }
+info() { echo "[INFO]  $*"; }
+warn() { echo "[WARN]  $*"; }
+fail() { echo "[ERROR] $*"; exit 1; }
 
 echo ""
 echo "+------------------------------------------+"
 echo "|      BorgorTube Setup (Linux/macOS)      |"
 echo "+------------------------------------------+"
 echo ""
-
-ok()   { echo "[OK]    $*"; }
-info() { echo "[INFO]  $*"; }
-warn() { echo "[WARN]  $*"; }
-fail() { echo "[ERROR] $*"; exit 1; }
 
 # ── Python ────────────────────────────────────────────────────────────────
 PYTHON=""
@@ -29,64 +31,55 @@ done
 [[ -z "$PYTHON" ]] && fail "Python 3.10+ not found. Install from https://python.org"
 ok "Found $($PYTHON --version)"
 
-# ── pip ───────────────────────────────────────────────────────────────────
-info "Upgrading pip..."
-"$PYTHON" -m pip install --upgrade pip -q
+# ── Virtualenv ────────────────────────────────────────────────────────────
+if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
+    info "Creating virtual environment at .venv ..."
+    "$PYTHON" -m venv "$VENV_DIR"
+    ok "Virtual environment created."
+else
+    ok "Virtual environment already exists."
+fi
+
+source "$VENV_DIR/bin/activate"
+ok "Virtual environment active."
 
 # ── Python dependencies ───────────────────────────────────────────────────
 info "Installing Python dependencies..."
-"$PYTHON" -m pip install -r "$SCRIPT_DIR/requirements.txt"
+pip install -q --upgrade pip
+pip install -r "$SCRIPT_DIR/requirements.txt"
 ok "Python dependencies installed."
 
-# ── Install Playwright Chromium ──────────────────────────────────────────────
-info "Installing Playwright Chromium browser (for comment scraping)..."
-if "$PYTHON" -m playwright install chromium --with-deps 2>/dev/null; then
+# ── Playwright Chromium ───────────────────────────────────────────────────
+info "Installing Playwright Chromium browser..."
+if python -m playwright install chromium --with-deps 2>/dev/null; then
     ok "Playwright Chromium installed."
 else
     warn "Playwright Chromium install failed. Comments may not load."
-    echo "        Retry: $PYTHON -m playwright install chromium"
+    echo "  Retry: source .venv/bin/activate && python -m playwright install chromium"
 fi
 
-# ── Verify yt-dlp-ejs ─────────────────────────────────────────────────────
-info "Verifying yt-dlp-ejs (YouTube challenge solver)..."
-if "$PYTHON" -c "import yt_dlp_ejs" 2>/dev/null; then
-    ok "yt-dlp-ejs installed."
-else
-    warn "yt-dlp-ejs import failed - retrying direct install..."
-    "$PYTHON" -m pip install yt-dlp-ejs
-fi
+# ── Verify yt-dlp-ejs ────────────────────────────────────────────────────
+info "Verifying yt-dlp-ejs..."
+python -c "import yt_dlp_ejs; print('[OK]    yt-dlp-ejs ready')" 2>/dev/null \
+    || warn "yt-dlp-ejs not importable — challenge solving may not work."
 
 # ── Optional tools ────────────────────────────────────────────────────────
 echo ""
 info "Checking optional tools..."
-
 if command -v mpv &>/dev/null; then
-    ok "mpv found ($(mpv --version | head -1))."
+    ok "mpv found."
 else
-    warn "mpv not found. MPV pop-out unavailable."
-    if [[ "$(uname)" == "Darwin" ]]; then
-        echo "        Install: brew install mpv"
-    else
-        echo "        Install: sudo apt install mpv"
-    fi
+    warn "mpv not found.    Install: sudo apt install mpv  /  brew install mpv"
 fi
-
 if command -v ffmpeg &>/dev/null; then
     ok "ffmpeg found."
 else
-    warn "ffmpeg not found. HLS in-browser HD streaming unavailable."
-    if [[ "$(uname)" == "Darwin" ]]; then
-        echo "        Install: brew install ffmpeg"
-    else
-        echo "        Install: sudo apt install ffmpeg"
-    fi
+    warn "ffmpeg not found. Install: sudo apt install ffmpeg  /  brew install ffmpeg"
 fi
-
 if command -v deno &>/dev/null; then
-    ok "Deno found ($(deno --version | head -1))."
+    ok "Deno found."
 else
-    warn "Deno not found. MPV real-time sync unavailable (optional)."
-    echo "        Install: curl -fsSL https://deno.land/install.sh | sh"
+    warn "Deno not found (optional). Install: curl -fsSL https://deno.land/install.sh | sh"
 fi
 
 echo ""

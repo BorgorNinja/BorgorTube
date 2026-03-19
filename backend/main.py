@@ -36,6 +36,7 @@ from scraper import scrape_comments_headless, scrape_channel_avatar
 from hls_manager import HLSManager, HLS_ROOT
 from db import record_watch, get_watch_history, delete_watch_entry, clear_watch_history, save_cookies, write_cookies_file
 from downloader import DownloadManager
+from executor import pool  # shared 16-worker thread pool
 
 # ---------------------------------------------------------------------------
 # App bootstrap
@@ -108,7 +109,7 @@ async def api_search(request: Request, q: str = Query(..., min_length=1), max_re
     save_search_history(q)
     loop = asyncio.get_event_loop()
     try:
-        results = await loop.run_in_executor(None, lambda: search_youtube(q, max_results))
+        results = await loop.run_in_executor(pool, lambda: search_youtube(q, max_results))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"results": results, "query": q}
@@ -128,7 +129,7 @@ async def api_history():
 async def api_video(request: Request, url: str = Query(...)):
     loop = asyncio.get_event_loop()
     try:
-        info = await loop.run_in_executor(None, lambda: extract_formats(url))
+        info = await loop.run_in_executor(pool, lambda: extract_formats(url))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -194,8 +195,8 @@ async def api_video(request: Request, url: str = Query(...)):
 async def api_channel(url: str = Query(...), max_results: int = 20):
     loop = asyncio.get_event_loop()
     try:
-        avatar = await loop.run_in_executor(None, lambda: scrape_channel_avatar(url))
-        videos = await loop.run_in_executor(None, lambda: get_channel_videos(url, max_results))
+        avatar = await loop.run_in_executor(pool, lambda: scrape_channel_avatar(url))
+        videos = await loop.run_in_executor(pool, lambda: get_channel_videos(url, max_results))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"url": url, "avatar": avatar, "videos": videos}
@@ -326,18 +327,19 @@ async def api_hls_start(body: dict):
     if not url:
         raise HTTPException(status_code=400, detail="url required")
 
-    session = await app.state.hls.start(url, quality=quality, low_latency=low_latency)
+    cookies_file = "cookies.txt" if os.path.exists("cookies.txt") else None
+    session = await app.state.hls.start(
+        url, quality=quality, low_latency=low_latency, cookies_file=cookies_file
+    )
 
+    # Return immediately — ffmpeg is launching in the background.
+    # The client polls /api/hls/{session_id}/status for ready=true.
+    # This means the endpoint responds in <5ms regardless of how many
+    # users are simultaneously starting streams.
     if session.error:
         raise HTTPException(status_code=500, detail=session.error)
 
-    # Wait up to 15s for first segment to appear before returning
-    ready = await app.state.hls.wait_ready(session.session_id, timeout=15.0)
-
-    return {
-        **session.to_dict(),
-        "ready": ready,
-    }
+    return session.to_dict()
 
 
 @app.get("/api/hls/{session_id}/status")

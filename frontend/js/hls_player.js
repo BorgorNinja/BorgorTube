@@ -61,6 +61,20 @@ window.BorgorHLS = (() => {
 
   // ── Start a new HLS session and attach to <video> ────────────────────
 
+  /** Poll /api/hls/{id}/status until ready or timeout. */
+  async function _pollReady(sessionId, timeoutMs = 25000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const s = await BorgorAPI.hlsStatus(sessionId);
+        if (s.state === "error") return false;
+        if (s.ready) return true;
+      } catch { /* ignore poll errors */ }
+      await new Promise(r => setTimeout(r, 400));
+    }
+    return false;
+  }
+
   /**
    * @param {string} videoUrl - original YouTube URL
    * @param {string} quality  - quality label e.g. "1080p"
@@ -74,19 +88,25 @@ window.BorgorHLS = (() => {
     // 1. Ask backend to start ffmpeg HLS session
     let session;
     try {
+      // Returns immediately — ffmpeg launches in the background on the server.
+      // We poll /status until ready=true instead of blocking the request.
       session = await BorgorAPI.hlsStart({ url: videoUrl, quality, low_latency: lowLatency });
     } catch (e) {
       console.warn("[HLS] backend session start failed:", e.message);
       return { ok: false, sessionId: null, fallbackUrl: null };
     }
 
-    if (!session.ready) {
+    activeSessionId = session.session_id;
+
+    // Poll for first segment — server responds in <5ms so this loop
+    // runs client-side while the server prepares segments in parallel.
+    const ready = await _pollReady(session.session_id, 25000);
+    if (!ready) {
       console.warn("[HLS] session not ready in time");
       await BorgorAPI.hlsStop(session.session_id).catch(() => {});
+      activeSessionId = null;
       return { ok: false, sessionId: null, fallbackUrl: null };
     }
-
-    activeSessionId = session.session_id;
     const playlistUrl = session.playlist_url; // e.g. /hls/abc12345/index.m3u8
 
     // 2. Attach via hls.js (or native HLS)

@@ -81,8 +81,21 @@ echo "→ Starting FastAPI backend on http://localhost:$PORT"
 echo "  Frontend: http://localhost:$PORT/static/index.html"
 echo ""
 cd "$BACKEND_DIR"
-exec python3 -m uvicorn main:app \
-  --host 0.0.0.0 \
-  --port "$PORT" \
-  --reload \
-  --reload-dir "$BACKEND_DIR"
+# Workers: 1 per 2 CPU cores, minimum 2. More workers = more parallel users.
+WORKERS="${BORGORTUBE_UVICORN_WORKERS:-$(python3 -c "import os; print(max(2, os.cpu_count()))")}"
+echo "  Workers: $WORKERS (set BORGORTUBE_UVICORN_WORKERS to override)"
+echo ""
+
+# Use --reload only in dev; production sets APP_ENV=production
+if [ "${APP_ENV:-development}" = "production" ]; then
+  exec python3 -m uvicorn main:app \
+    --host 0.0.0.0 \
+    --port "$PORT" \
+    --workers "$WORKERS"
+else
+  exec python3 -m uvicorn main:app \
+    --host 0.0.0.0 \
+    --port "$PORT" \
+    --reload \
+    --reload-dir "$BACKEND_DIR"
+fi

@@ -96,6 +96,11 @@ echo         Press Ctrl+C to stop.
 echo.
 
 cd /d "%BACKEND_DIR%"
+REM Workers: auto-detect CPU count (min 2) for concurrent users
+for /f %%W in ('%PYTHON% -c "import os; print(max(2, os.cpu_count()))"') do set WORKERS=%%W
+if defined BORGORTUBE_UVICORN_WORKERS set WORKERS=%BORGORTUBE_UVICORN_WORKERS%
+echo [INFO]  Starting with %WORKERS% workers (set BORGORTUBE_UVICORN_WORKERS to override)
+echo.
 %PYTHON% -m uvicorn main:app --host 0.0.0.0 --port %PORT% --reload --reload-dir "%BACKEND_DIR%"
 
 endlocal

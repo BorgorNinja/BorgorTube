@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BorgorTube</title>
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#ff0033" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <!-- Skip to content (accessibility) -->
+  <a class="skip-link" href="#content">Skip to content</a>
+
+  <!-- ── TOP NAV ─────────────────────────────────────────────────────── -->
+  <header class="topnav" id="topnav">
+    <div class="topnav__left">
+      <button class="icon-btn" id="btn-menu" title="Menu" aria-label="Menu">
+        <svg viewBox="0 0 24 24"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg>
+      </button>
+      <a href="#" class="logo" id="btn-home">
+        <span class="logo__icon">▶</span>
+        <span class="logo__text">BorgorTube</span>
+      </a>
+    </div>
+
+    <form class="search-form" id="search-form" role="search" autocomplete="off">
+      <div class="search-wrap">
+        <input
+          type="search"
+          class="search-input"
+          id="search-input"
+          placeholder="Search or paste a YouTube URL…"
+          aria-label="Search"
+          spellcheck="false"
+        />
+        <button type="submit" class="search-btn" aria-label="Search">
+          <svg viewBox="0 0 24 24"><path d="M21 21l-4.35-4.35m0 0A7.5 7.5 0 1 0 6.5 6.5a7.5 7.5 0 0 0 10.15 10.15z" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </form>
+
+    <div class="topnav__right">
+      <button class="icon-btn" id="btn-theme" title="Toggle theme" aria-label="Toggle theme">
+        <svg class="icon-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/></svg>
+        <svg class="icon-sun" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ── SIDEBAR ─────────────────────────────────────────────────────── -->
+  <aside class="sidebar" id="sidebar">
+    <nav class="sidebar__nav">
+      <a href="#" class="sidebar__item active" id="nav-home">
+        <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+        <span>Home</span>
+      </a>
+      <a href="#" class="sidebar__item" id="nav-history">
+        <svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+        <span>History</span>
+      </a>
+      <hr class="sidebar__divider" />
+      <div class="sidebar__label">RECENT SEARCHES</div>
+      <div id="history-chips" class="history-chips"></div>
+      <hr class="sidebar__divider" />
+      <div class="sidebar__label">EXPLORE</div>
+      <a href="#" class="sidebar__item" data-search="trending music">
+        <svg viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>
+        <span>Music</span>
+      </a>
+      <a href="#" class="sidebar__item" data-search="gaming highlights">
+        <svg viewBox="0 0 24 24"><path d="M21 6H3c-1.1 0-2 .9-2 2v8c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-10 7H8v3H6v-3H3v-2h3V8h2v3h3v2zm4.5 2c-.83 0-1.5-.67-1.5-1.5S14.67 12 15.5 12s1.5.67 1.5 1.5S16.33 15 15.5 15zm3-3c-.83 0-1.5-.67-1.5-1.5S17.67 9 18.5 9s1.5.67 1.5 1.5S19.33 12 18.5 12z"/></svg>
+        <span>Gaming</span>
+      </a>
+      <a href="#" class="sidebar__item" data-search="news today">
+        <svg viewBox="0 0 24 24"><path d="M20 3H4v10c0 2.21 1.79 4 4 4h6c2.21 0 4-1.79 4-4v-3h2c1.11 0 2-.89 2-2V5c0-1.11-.89-2-2-2zm0 5h-2V5h2v3zM4 19h16v2H4z"/></svg>
+        <span>News</span>
+      </a>
+    </nav>
+  </aside>
+
+  <!-- ── MAIN CONTENT ─────────────────────────────────────────────────── -->
+  <main class="content" id="content" role="main" aria-label="Main content">
+
+    <!-- HOME / SEARCH RESULTS PAGE -->
+    <section class="page" id="page-home" aria-label="Search results" aria-live="polite">
+      <div class="page-header" id="home-header" style="display:none">
+        <h2 class="page-title" id="home-title">Search Results</h2>
+      </div>
+      <div class="home-placeholder" id="home-placeholder">
+        <div class="placeholder-logo">▶</div>
+        <h1 class="placeholder-title">BorgorTube</h1>
+        <p class="placeholder-sub">Search for videos to get started</p>
+      </div>
+      <div class="video-grid" id="video-grid"></div>
+      <div class="loading-spinner" id="home-spinner" hidden>
+        <div class="spinner"></div>
+        <span>Searching…</span>
+      </div>
+    </section>
+
+    <!-- WATCH PAGE -->
+    <section class="page" id="page-watch" hidden aria-label="Video player">
+      <div class="watch-layout">
+        <!-- Primary: player + info -->
+        <div class="watch-primary">
+          <div class="player-wrapper" id="player-wrapper">
+            <video
+              id="video-player"
+              aria-label="Video player"
+              class="video-player"
+              controls
+              preload="metadata"
+              playsinline
+            ></video>
+            <div class="player-overlay" id="player-overlay" hidden>
+              <div class="spinner"></div>
+            </div>
+          </div>
+
+          <!-- Player controls bar -->
+          <div class="player-controls" id="player-controls">
+            <div class="pc-left">
+              <select class="quality-select" id="quality-select" title="Quality">
+                <option>360p</option>
+              </select>
+              <label class="pc-toggle" title="Low-latency mode">
+                <input type="checkbox" id="chk-low-latency" />
+                <span>Low latency</span>
+              </label>
+            </div>
+            <div class="pc-right">
+              <button class="pc-btn" id="btn-download" title="Download video">
+                <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                Download
+              </button>
+              <button class="pc-btn" id="btn-cookies" title="Upload cookies.txt for age-restricted videos">
+                <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                Cookies
+              </button>
+              <button class="pc-btn" id="btn-mpv-pop" title="Open in MPV (pop-out)">
+                <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                MPV Pop-out
+              </button>
+              <button class="pc-btn" id="btn-mpv-kill" title="Kill MPV">
+                <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
+                Kill MPV
+              </button>
+              <span class="kbd-hint" title="Press ? for keyboard shortcuts">?</span>
+              <button class="pc-btn" id="btn-pip" title="Picture-in-picture">
+                <svg viewBox="0 0 24 24"><path d="M19 11h-8v6h8v-6zm4 8V4.98C23 3.88 22.1 3 21 3H3c-1.1 0-2 .88-2 1.98V19c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2zm-2 .02H3V4.97h18v14.05z"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <!-- Player mode badge (HLS / Direct) -->
+          <div id="player-mode-badge" class="mode-badge" hidden></div>
+
+          <!-- MPV status badge -->
+          <div class="mpv-status" id="mpv-status" hidden>
+            <span class="mpv-dot" id="mpv-dot"></span>
+            <span id="mpv-status-text">MPV not running</span>
+          </div>
+
+          <!-- Video info -->
+          <div class="video-info" id="video-info">
+            <h1 class="video-title" id="video-title">Loading…</h1>
+            <div class="video-meta" id="video-meta">
+              <span id="video-views"></span>
+              <span id="video-date"></span>
+            </div>
+            <div class="channel-row" id="channel-row">
+              <img class="channel-avatar" id="channel-avatar" src="" alt="" loading="lazy" />
+              <div class="channel-details">
+                <a href="#" class="channel-name" id="channel-name"></a>
+              </div>
+            </div>
+            <div class="video-desc-wrap">
+              <p class="video-desc" id="video-desc"></p>
+              <button class="desc-toggle" id="desc-toggle">Show more</button>
+            </div>
+          </div>
+
+          <!-- Comments -->
+          <div class="comments-section" id="comments-section">
+            <h3 class="comments-header">Comments</h3>
+            <div class="comments-list" id="comments-list" aria-label="Video comments" aria-live="polite"></div>
+            <div class="loading-spinner" id="comments-spinner" hidden>
+              <div class="spinner"></div>
+              <span>Loading comments…</span>
+            </div>
+            <button class="btn-load-more" id="btn-load-more">Load more comments</button>
+          </div>
+        </div>
+
+        <!-- Sidebar: suggested videos -->
+        <aside class="watch-sidebar">
+          <h3 class="sidebar-section-title">Up Next</h3>
+          <div class="suggested-list" id="suggested-list"></div>
+          <div class="loading-spinner" id="suggested-spinner" hidden>
+            <div class="spinner"></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- CHANNEL PAGE -->
+    <section class="page" id="page-channel" hidden aria-label="Channel page">
+      <div class="channel-hero" id="channel-hero">
+        <img class="channel-hero__avatar" id="channel-hero-avatar" src="" alt="" />
+        <div class="channel-hero__info">
+          <h1 class="channel-hero__name" id="channel-hero-name"></h1>
+          <p class="channel-hero__meta" id="channel-hero-meta">Loading videos…</p>
+        </div>
+      </div>
+      <div class="video-grid" id="channel-grid"></div>
+    </section>
+
+  </main>
+
+  <!-- ── TOAST ─────────────────────────────────────────────────────────── -->
+  <div class="toast" id="toast" aria-live="polite"></div>
+
+  <script src="js/api.js"></script>
+  <script src="js/hls_player.js"></script>
+  <script src="js/player.js"></script>
+  <script src="js/search.js"></script>
+  <script src="js/sync.js"></script>
+  <script src="js/errors.js"></script>
+  <script src="js/features.js"></script>
+  <script src="js/app.js"></script>
+  <script>
+    // PWA service worker (Phase 5i)
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/static/sw.js")
+        .catch(() => {});
+    }
+  </script>
+</body>
+</html>

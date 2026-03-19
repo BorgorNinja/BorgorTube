@@ -1,6 +1,35 @@
-PyQt5
-pyppeteer
+# BorgorTube – Python backend dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Original dependencies (preserved) ─────────────────────────────────────
+PyQt5          # kept for reference / optional desktop fallback
+playwright     # headless comment scraping (replaces broken pyppeteer)
 requests
 yt_dlp
+yt-dlp-ejs             # JS challenge solver for YouTube n-challenge (no Node/Deno needed)
 requests-cache
 bs4
+
+# ── New web backend dependencies ──────────────────────────────────────────
+aiosqlite             # async SQLite for watch history (Phase 5h)
+slowapi               # rate limiting for FastAPI (Phase 6c)
+
+fastapi
+uvicorn[standard]     # ASGI server (includes websockets + httptools)
+python-multipart      # needed by FastAPI for form data
+
+# ── Runtime requirements (installed separately, not via pip) ───────────────
+# ffmpeg        - required for Phase 2 HLS in-browser HD streaming
+#                  Linux:   sudo apt install ffmpeg
+#                  macOS:   brew install ffmpeg
+#                  Windows: winget install Gyan.FFmpeg
+#
+# mpv          - media player CLI; install via your OS package manager
+#                  Linux:   sudo apt install mpv
+#                  macOS:   brew install mpv
+#                  Windows: winget install mpv
+#
+# deno         - JavaScript/TypeScript runtime for the WS bridge server
+#                  Install: curl -fsSL https://deno.land/install.sh | sh
+#                  Or:      winget install DenoLand.Deno
+#                  See:     https://deno.land

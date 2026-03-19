@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+borgortube.db
+*.log
+mpvlog.txt
+search_history.json
+cookies.txt
+youtube_cache.sqlite
+/tmp/borgortube_hls/
+node_modules/
+.DS_Store
+borgortube_web.zip
+nginx/ssl/
+/data/

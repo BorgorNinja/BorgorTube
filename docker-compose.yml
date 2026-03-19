@@ -1,0 +1,98 @@
+version: "3.9"
+
+# BorgorTube – Docker Compose stack
+#
+# Services:
+#   api    – Python FastAPI backend (yt-dlp, mpv, ffmpeg, aiosqlite)
+#   deno   – Deno WebSocket MPV bridge (real-time mpv IPC relay)
+#   nginx  – Reverse proxy + static file server (port 80 / 443)
+#
+# Usage:
+#   docker compose up -d            # start all services
+#   docker compose logs -f api      # stream API logs
+#   docker compose down -v          # stop + remove volumes
+#
+# Environment:
+#   Copy .env.example to .env and adjust before first run.
+
+services:
+
+  # ── Python FastAPI backend ──────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: borgortube_api
+    restart: unless-stopped
+    environment:
+      - BORGORTUBE_DB=/data/borgortube.db
+      - BORGORTUBE_DOWNLOADS=/data/downloads
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - borgortube_data:/data
+      # Mount source for live reload during dev (comment out for prod)
+      - ./backend:/app/backend:ro
+      - ./frontend:/app/frontend:ro
+    ports:
+      - "8000:8000"       # expose directly for dev; nginx proxies in prod
+    networks:
+      - borgortube_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ── Deno MPV WebSocket bridge ───────────────────────────────────────────
+  deno:
+    image: denoland/deno:2.3.1
+    container_name: borgortube_deno
+    restart: unless-stopped
+    command: >
+      run
+      --allow-net
+      --allow-read=/tmp
+      --allow-write=/tmp
+      --allow-env
+      /app/deno/ws_bridge.ts
+    environment:
+      - WS_PORT=8001
+      - MPV_SOCKET=/tmp/mpvsocket
+      - POLL_MS=1000
+    volumes:
+      - ./deno:/app/deno:ro
+      - /tmp:/tmp          # shared with host so it can reach mpv socket
+    ports:
+      - "8001:8001"
+    networks:
+      - borgortube_net
+    depends_on:
+      - api
+
+  # ── Nginx reverse proxy ─────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: borgortube_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro        # put your certs here (optional)
+      - ./frontend:/srv/static:ro            # serve frontend directly
+      - borgortube_data:/data:ro             # for download file serving
+    networks:
+      - borgortube_net
+    depends_on:
+      - api
+      - deno
+
+networks:
+  borgortube_net:
+    driver: bridge
+
+volumes:
+  borgortube_data:
+    driver: local

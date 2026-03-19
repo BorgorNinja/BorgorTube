@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyc
+.env
+.git
+.gitignore
+borgortube.db
+*.log
+mpvlog.txt
+search_history.json
+cookies.txt
+/tmp/
+node_modules/
+.DS_Store
+borgortube_web.zip

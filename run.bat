@@ -1,15 +1,9 @@
 @echo off
-REM BorgorTube – Full stack startup (Windows)
-REM Usage: run.bat [--no-deno] [--port 8000]
-REM
-REM On every run: detects any existing BorgorTube instance via PID file and
-REM port check, kills it, then starts fresh. Only one instance runs at a time.
-
 setlocal EnableDelayedExpansion
 
 set PORT=8000
 set DENO_PORT=8001
-set RUN_DENO=true
+set RUN_DENO=1
 set SCRIPT_DIR=%~dp0
 set BACKEND_DIR=%SCRIPT_DIR%backend
 set DENO_DIR=%SCRIPT_DIR%deno
@@ -19,8 +13,8 @@ set DENO_PID_FILE=%TEMP%\borgortube_deno.pid
 REM ── Parse arguments ───────────────────────────────────────────────────────
 :parse_args
 if "%~1"=="" goto done_args
-if /i "%~1"=="--no-deno" ( set RUN_DENO=false & shift & goto parse_args )
-if /i "%~1"=="--port"    ( set PORT=%~2 & shift & shift & goto parse_args )
+if /i "%~1"=="--no-deno" ( set RUN_DENO=0 & shift & goto parse_args )
+if /i "%~1"=="--port"    ( set PORT=%~2  & shift & shift & goto parse_args )
 shift & goto parse_args
 :done_args
 
@@ -32,155 +26,148 @@ echo.
 
 REM ── Find Python ───────────────────────────────────────────────────────────
 set PYTHON=
-for %%P in (python python3 py) do (
-    if not defined PYTHON (
-        where %%P >nul 2>&1 && set PYTHON=%%P
-    )
-)
+where python  >nul 2>&1 && set PYTHON=python
+where python3 >nul 2>&1 && if not defined PYTHON set PYTHON=python3
+where py      >nul 2>&1 && if not defined PYTHON set PYTHON=py
 if not defined PYTHON (
     echo [ERROR] Python 3 not found.
     echo         Install: winget install Python.Python.3
     pause & exit /b 1
 )
 
-REM ── Kill existing API instance ────────────────────────────────────────────
+REM ── Kill existing API by PID file ─────────────────────────────────────────
 echo [INFO]  Checking for existing BorgorTube instance...
 
-REM Method 1: PID file
 if exist "%PID_FILE%" (
     set /p OLD_PID=<"%PID_FILE%"
-    if defined OLD_PID (
-        REM Check if process is actually running
-        tasklist /FI "PID eq !OLD_PID!" 2>nul | find "!OLD_PID!" >nul
+    if defined OLD_PID if not "!OLD_PID!"=="" (
+        tasklist /FI "PID eq !OLD_PID!" /NH 2>nul | findstr /I "!OLD_PID!" >nul 2>&1
         if not errorlevel 1 (
-            echo [INFO]  Found existing API process (PID !OLD_PID!) -- killing...
-            taskkill /PID !OLD_PID! /F >nul 2>&1
-            if errorlevel 1 (
-                echo [WARN]  Could not kill PID !OLD_PID! (may have already exited)
-            ) else (
-                echo [OK]    Killed PID !OLD_PID!
-            )
+            echo [INFO]  Found existing API process PID !OLD_PID! -- killing...
+            taskkill /PID !OLD_PID! /F /T >nul 2>&1
+            echo [OK]    Stopped PID !OLD_PID!
         ) else (
-            echo [INFO]  Stale PID file found (process !OLD_PID! not running) -- clearing.
+            echo [INFO]  Stale PID file cleared.
         )
     )
     del "%PID_FILE%" >nul 2>&1
 )
 
-REM Method 2: Port check (catches instances started without this script)
-for /f "tokens=5" %%A in ('netstat -ano 2^>nul ^| findstr /R ":%PORT% .*LISTENING"') do (
+REM ── Kill whatever is on PORT (no regex, just plain findstr) ───────────────
+netstat -ano 2>nul > "%TEMP%\bt_netstat.tmp"
+for /f "tokens=5" %%A in ('findstr ":%PORT% " "%TEMP%\bt_netstat.tmp" ^| findstr "LISTENING"') do (
     set PORT_PID=%%A
-    if defined PORT_PID (
-        if "!PORT_PID!" neq "0" (
-            echo [INFO]  Port %PORT% in use by PID !PORT_PID! -- killing...
-            taskkill /PID !PORT_PID! /F >nul 2>&1
-            if errorlevel 1 (
-                echo [WARN]  Could not kill port process !PORT_PID!
-            ) else (
-                echo [OK]    Killed process on port %PORT% (PID !PORT_PID!)
-            )
-        )
+    if defined PORT_PID if not "!PORT_PID!"=="0" (
+        echo [INFO]  Port %PORT% occupied by PID !PORT_PID! -- killing...
+        taskkill /PID !PORT_PID! /F /T >nul 2>&1
+        echo [OK]    Freed port %PORT%
     )
 )
+del "%TEMP%\bt_netstat.tmp" >nul 2>&1
 
-REM ── Kill existing Deno bridge ─────────────────────────────────────────────
+REM ── Kill existing Deno by PID file ────────────────────────────────────────
 if exist "%DENO_PID_FILE%" (
-    set /p OLD_DENO_PID=<"%DENO_PID_FILE%"
-    if defined OLD_DENO_PID (
-        tasklist /FI "PID eq !OLD_DENO_PID!" 2>nul | find "!OLD_DENO_PID!" >nul
-        if not errorlevel 1 (
-            echo [INFO]  Found existing Deno bridge (PID !OLD_DENO_PID!) -- killing...
-            taskkill /PID !OLD_DENO_PID! /F >nul 2>&1
-            echo [OK]    Deno bridge stopped.
-        )
+    set /p OLD_DENO=<"%DENO_PID_FILE%"
+    if defined OLD_DENO if not "!OLD_DENO!"=="" (
+        taskkill /PID !OLD_DENO! /F /T >nul 2>&1
+        echo [OK]    Stopped old Deno bridge PID !OLD_DENO!
     )
     del "%DENO_PID_FILE%" >nul 2>&1
 )
 
-REM Kill any leftover Deno process on the bridge port too
-for /f "tokens=5" %%A in ('netstat -ano 2^>nul ^| findstr /R ":%DENO_PORT% .*LISTENING"') do (
-    set DENO_PORT_PID=%%A
-    if defined DENO_PORT_PID if "!DENO_PORT_PID!" neq "0" (
-        echo [INFO]  Port %DENO_PORT% in use by PID !DENO_PORT_PID! -- killing...
-        taskkill /PID !DENO_PORT_PID! /F >nul 2>&1
+REM ── Kill whatever is on DENO_PORT ─────────────────────────────────────────
+netstat -ano 2>nul > "%TEMP%\bt_netstat2.tmp"
+for /f "tokens=5" %%A in ('findstr ":%DENO_PORT% " "%TEMP%\bt_netstat2.tmp" ^| findstr "LISTENING"') do (
+    set DP=%%A
+    if defined DP if not "!DP!"=="0" (
+        taskkill /PID !DP! /F /T >nul 2>&1
+        echo [OK]    Freed Deno port %DENO_PORT%
     )
 )
+del "%TEMP%\bt_netstat2.tmp" >nul 2>&1
 
 REM ── Optional tool checks ──────────────────────────────────────────────────
 where mpv    >nul 2>&1 || echo [WARN]  mpv not found.    Install: winget install mpv
 where ffmpeg >nul 2>&1 || echo [WARN]  ffmpeg not found. Install: winget install Gyan.FFmpeg
 
+REM ── Virtualenv ────────────────────────────────────────────────────────────
+if not exist "%SCRIPT_DIR%.venv\Scripts\activate.bat" (
+    echo [INFO]  Creating virtual environment...
+    %PYTHON% -m venv "%SCRIPT_DIR%.venv"
+    echo [OK]    Virtual environment created.
+)
+call "%SCRIPT_DIR%.venv\Scripts\activate.bat"
+echo [OK]    Virtual environment active.
+
 REM ── Python deps ───────────────────────────────────────────────────────────
 echo [INFO]  Checking Python dependencies...
-%PYTHON% -m pip install -q -r "%SCRIPT_DIR%requirements.txt"
-if errorlevel 1 ( echo [ERROR] pip install failed. & pause & exit /b 1 )
+pip install -q -r "%SCRIPT_DIR%requirements.txt"
+echo [OK]    Dependencies ready.
 
 REM ── Start Deno bridge ─────────────────────────────────────────────────────
-if /i "%RUN_DENO%"=="true" (
+if "%RUN_DENO%"=="1" (
     where deno >nul 2>&1
     if not errorlevel 1 (
         echo [INFO]  Starting Deno MPV bridge on port %DENO_PORT%...
-        start "BorgorTube Deno Bridge" /min cmd /c ^
-            "set WS_PORT=%DENO_PORT% && set MPV_SOCKET=\\.\pipe\mpvsocket && deno run --allow-net --allow-read --allow-write --allow-env "%DENO_DIR%\ws_bridge.ts""
-
-        REM Give it a moment to start, then grab its PID from the port
+        start "BorgorTube Deno Bridge" /min cmd /c "set WS_PORT=%DENO_PORT%&& set MPV_SOCKET=\\.\pipe\mpvsocket&& deno run --allow-net --allow-read --allow-write --allow-env "%DENO_DIR%\ws_bridge.ts""
         timeout /t 2 /nobreak >nul
-        for /f "tokens=5" %%A in ('netstat -ano 2^>nul ^| findstr /R ":%DENO_PORT% .*LISTENING"') do (
-            echo %%A> "%DENO_PID_FILE%"
-            echo [OK]    Deno bridge started (PID %%A)
-            goto deno_done
+        REM Grab Deno PID from the port it opened
+        netstat -ano 2>nul > "%TEMP%\bt_deno.tmp"
+        for /f "tokens=5" %%A in ('findstr ":%DENO_PORT% " "%TEMP%\bt_deno.tmp" ^| findstr "LISTENING"') do (
+            echo %%A>"%DENO_PID_FILE%"
+            echo [OK]    Deno bridge started PID %%A
         )
-        echo [INFO]  Deno bridge started (PID unknown -- bridge may take a moment)
-        :deno_done
+        del "%TEMP%\bt_deno.tmp" >nul 2>&1
     ) else (
-        echo [WARN]  deno not found. MPV real-time sync will not work.
+        echo [WARN]  deno not found. Install: winget install DenoLand.Deno
     )
 )
+
+REM ── Worker count ──────────────────────────────────────────────────────────
+for /f %%W in ('python -c "import os; print(max(2, os.cpu_count()))"') do set WORKERS=%%W
+if defined BORGORTUBE_UVICORN_WORKERS set WORKERS=%BORGORTUBE_UVICORN_WORKERS%
 
 REM ── Start FastAPI ─────────────────────────────────────────────────────────
 echo.
 echo [INFO]  Starting FastAPI on http://localhost:%PORT%
 echo [INFO]  Frontend:  http://localhost:%PORT%/static/index.html
+echo [INFO]  Workers:   %WORKERS%
+echo [INFO]  PID file:  %PID_FILE%
 echo.
 echo         Press Ctrl+C to stop.
 echo.
 
 cd /d "%BACKEND_DIR%"
-for /f %%W in ('%PYTHON% -c "import os; print(max(2, os.cpu_count()))"') do set WORKERS=%%W
-if defined BORGORTUBE_UVICORN_WORKERS set WORKERS=%BORGORTUBE_UVICORN_WORKERS%
-echo [INFO]  Workers: %WORKERS%
-echo.
 
-REM Start uvicorn and capture its PID
-start /b "" %PYTHON% -m uvicorn main:app --host 0.0.0.0 --port %PORT% --reload --reload-dir "%BACKEND_DIR%"
+start "BorgorTube API" /b python -m uvicorn main:app --host 0.0.0.0 --port %PORT% --reload --reload-dir "%BACKEND_DIR%"
 
-REM Wait briefly then write PID of the process on that port
+REM Wait a moment then write the PID
 timeout /t 3 /nobreak >nul
-for /f "tokens=5" %%A in ('netstat -ano 2^>nul ^| findstr /R ":%PORT% .*LISTENING"') do (
-    echo %%A> "%PID_FILE%"
-    echo [OK]    API started (PID %%A) -- PID file: %PID_FILE%
-    goto started
+netstat -ano 2>nul > "%TEMP%\bt_api.tmp"
+for /f "tokens=5" %%A in ('findstr ":%PORT% " "%TEMP%\bt_api.tmp" ^| findstr "LISTENING"') do (
+    echo %%A>"%PID_FILE%"
+    echo [OK]    API started PID %%A -- PID saved to %PID_FILE%
+    goto api_started
 )
-echo [INFO]  API starting... (PID file will be written shortly)
-:started
+:api_started
+del "%TEMP%\bt_api.tmp" >nul 2>&1
 
-REM Keep window alive (uvicorn runs in background via start /b)
 echo.
-echo [INFO]  BorgorTube is running. Close this window or press Ctrl+C to stop.
-echo         PID file: %PID_FILE%
+echo [INFO]  BorgorTube is running. Close this window or press any key to stop.
 echo.
 pause >nul
 
-REM Cleanup on exit
+REM ── Cleanup ───────────────────────────────────────────────────────────────
+echo [INFO]  Shutting down...
 if exist "%PID_FILE%" (
-    set /p FINAL_PID=<"%PID_FILE%"
-    taskkill /PID !FINAL_PID! /F >nul 2>&1
+    set /p KILL_PID=<"%PID_FILE%"
+    if defined KILL_PID taskkill /PID !KILL_PID! /F /T >nul 2>&1
     del "%PID_FILE%" >nul 2>&1
 )
 if exist "%DENO_PID_FILE%" (
-    set /p FINAL_DENO=<"%DENO_PID_FILE%"
-    taskkill /PID !FINAL_DENO! /F >nul 2>&1
+    set /p KILL_DENO=<"%DENO_PID_FILE%"
+    if defined KILL_DENO taskkill /PID !KILL_DENO! /F /T >nul 2>&1
     del "%DENO_PID_FILE%" >nul 2>&1
 )
-
+echo [OK]    Stopped.
 endlocal

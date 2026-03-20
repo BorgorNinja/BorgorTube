@@ -36,6 +36,14 @@ window.BorgorSearch = (() => {
     card.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") onClick(video);
     });
+    // Prefetch on hover — resolves stream URLs before user clicks
+    let prefetchTimer = null;
+    card.addEventListener("mouseenter", () => {
+      prefetchTimer = setTimeout(() => {
+        BorgorAPI.prefetch(video.videoId, "720p", false);
+      }, 300);  // 300ms debounce
+    });
+    card.addEventListener("mouseleave", () => clearTimeout(prefetchTimer));
 
     return card;
   }

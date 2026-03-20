@@ -40,7 +40,8 @@ FORMAT_MAPPING: dict[str, str] = {
     "1080p":   "bestvideo[height>=1080][vcodec^=avc]+bestaudio/bestvideo[height>=1080]+bestaudio/best",
     "720p60":  "bestvideo[height>=720][fps>=60][vcodec^=avc]+bestaudio/bestvideo[height>=720][fps>=60]+bestaudio/best",
     "720p":    "bestvideo[height>=720][height<1080][vcodec^=avc]+bestaudio/bestvideo[height>=720][height<1080]+bestaudio/best",
-    "360p":    "bestvideo[height>=360][height<720][vcodec^=avc]+bestaudio/bestvideo[height>=360][height<720]+bestaudio/best",
+    "480p":    "bestvideo[height>=480][height<720][vcodec^=avc]+bestaudio/bestvideo[height>=480][height<720]+bestaudio/best",
+    "360p":    "bestvideo[height>=360][height<480][vcodec^=avc]+bestaudio/bestvideo[height>=360][height<480]+bestaudio/best",
     "240p":    "bestvideo[height>=240][height<360][vcodec^=avc]+bestaudio/bestvideo[height>=240][height<360]+bestaudio/best",
     "144p":    "bestvideo[height>=144][height<240][vcodec^=avc]+bestaudio/bestvideo[height>=144][height<240]+bestaudio/best",
 }
@@ -195,73 +196,59 @@ def resolve_stream_urls(
     cookies_file: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """
-    Resolve the best video+audio URLs for a given quality.
+    Resolve the exact video+audio stream URLs for a given quality by running
+    yt-dlp with the FORMAT_MAPPING format string for that quality.
 
-    OPTIMISATION: reuses extraction_cache from extract_formats so that
-    /api/video and /api/hls/start for the same video share a single
-    yt-dlp call instead of running it twice.
+    This is the ONLY correct way to get quality-specific URLs — attempting to
+    pick from a generic full-extraction cache gives wrong results because
+    yt-dlp selects and processes the best matching format at extraction time.
+
+    The stream_url_cache keys on (url, quality) so each quality is resolved
+    once and shared across all users requesting the same video+quality.
     """
-    cache_key = (video_url, quality)
+    cache_key = (video_url, quality, cookies_file)
     cached = _cache_get(stream_url_cache, cache_key)
     if cached is not None:
         return cached
 
     fmt_str = FORMAT_MAPPING.get(quality, "best")
 
-    # Reuse the full extraction cache if available (avoids second yt-dlp call)
-    full_key = (video_url, cookies_file)
-    info = _cache_get(extraction_cache, full_key)
+    opts = {
+        "quiet": True,
+        "skip_download": True,
+        "dump_single_json": True,
+        "http_headers": {"User-Agent": USER_AGENT},
+        "socket_timeout": 10,
+        "format": fmt_str,       # ← quality-specific format selector
+        "extractor_args": YTDLP_EXTRACTOR_ARGS,
+    }
+    if cookies_file:
+        opts["cookies"] = cookies_file
 
-    if info is None:
-        opts = {
-            "quiet": True,
-            "skip_download": True,
-            "dump_single_json": True,
-            "http_headers": {"User-Agent": USER_AGENT},
-            "socket_timeout": 10,
-            "format": fmt_str,
-            "extractor_args": YTDLP_EXTRACTOR_ARGS,
-        }
-        if cookies_file:
-            opts["cookies"] = cookies_file
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-        if info and info.get("formats"):
-            _cache_set(extraction_cache, full_key, info)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
 
-    # Extract video+audio URLs from formats list using quality string
-    formats = info.get("formats", [])
     v_url: str = ""
     a_url: Optional[str] = None
 
-    # Try to find matching formats by quality bucket
-    target_h = _quality_to_height(quality)
-    video_formats = sorted(
-        [f for f in formats if f.get("vcodec") not in (None, "none") and f.get("height")],
-        key=lambda f: abs((f.get("height") or 0) - target_h)
-    )
-    audio_formats = sorted(
-        [f for f in formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")],
-        key=lambda f: -(f.get("tbr") or 0)
-    )
+    # yt-dlp places the resolved streams in requested_formats when merging
+    requested = info.get("requested_formats") or []
+    for f in requested:
+        vcodec = f.get("vcodec") or "none"
+        acodec = f.get("acodec") or "none"
+        if vcodec != "none" and not v_url:
+            v_url = f.get("url", "")
+        if acodec != "none" and vcodec == "none" and not a_url:
+            a_url = f.get("url")
 
-    if video_formats:
-        v_url = video_formats[0]["url"]
-    if audio_formats:
-        a_url = audio_formats[0]["url"]
-
-    # Fallback: use requested_formats if available
-    if not v_url:
-        requested = info.get("requested_formats") or []
-        for f in requested:
-            if f.get("vcodec") not in (None, "none") and not v_url:
-                v_url = f.get("url", "")
-            if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none") and not a_url:
-                a_url = f.get("url")
-
-    # Last resort: top-level url
+    # Single merged format (e.g. progressive 360p)
     if not v_url:
         v_url = info.get("url", "")
+
+    # Also cache the full info so /api/video can reuse it
+    if info.get("formats"):
+        full_key = (video_url, cookies_file)
+        _cache_set(extraction_cache, full_key, info)
 
     result = (v_url, a_url)
     if v_url:
@@ -271,8 +258,8 @@ def resolve_stream_urls(
 
 def _quality_to_height(quality: str) -> int:
     mapping = {"2k": 1440, "1080p60": 1080, "1080p": 1080,
-               "720p60": 720, "720p": 720, "360p": 360,
-               "240p": 240, "144p": 144}
+               "720p60": 720, "720p": 720, "480p": 480,
+               "360p": 360, "240p": 240, "144p": 144}
     return mapping.get(quality, 360)
 
 

@@ -37,6 +37,16 @@ from hls_manager import HLSManager, HLS_ROOT
 from db import record_watch, get_watch_history, delete_watch_entry, clear_watch_history, save_cookies, write_cookies_file
 from downloader import DownloadManager
 from executor import pool  # shared 16-worker thread pool
+from invidious import (
+    search as invidious_search,
+    get_video_info as invidious_video_info,
+    get_recommended,
+    get_channel_videos_fast,
+    pick_stream_urls,
+    extract_video_id,
+    get_healthy_instances,
+)
+from prefetch import PrefetchManager
 
 # ---------------------------------------------------------------------------
 # App bootstrap
@@ -44,9 +54,14 @@ from executor import pool  # shared 16-worker thread pool
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.mpv = MPVManager()
-    app.state.hls = HLSManager()
-    app.state.dl  = DownloadManager()
+    app.state.mpv      = MPVManager()
+    app.state.hls      = HLSManager()
+    app.state.dl       = DownloadManager()
+    app.state.prefetch = PrefetchManager()
+    app.state.prefetch.set_hls_manager(app.state.hls)
+    # Kick off Invidious health check in background
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(pool, get_healthy_instances)
     # Periodic cleanup task for expired HLS sessions
     async def _cleanup_loop():
         while True:
@@ -495,3 +510,292 @@ async def api_download_cancel(job_id: str):
 @app.get("/api/download")
 async def api_download_list():
     return {"jobs": app.state.dl.list_jobs()}
+
+
+# ---------------------------------------------------------------------------
+# Fast search via Invidious (FreeTube approach)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/search/fast")
+async def api_search_fast(
+    request: Request,
+    q: str = Query(..., min_length=1),
+    max_results: int = 20,
+):
+    """
+    Invidious-first search. Returns in ~200-400ms vs yt-dlp's 3-6s.
+    Falls back to yt-dlp if all Invidious instances are unavailable.
+    """
+    save_search_history(q)
+    loop = asyncio.get_event_loop()
+
+    # Try Invidious first
+    results = await loop.run_in_executor(
+        pool, lambda: invidious_search(q, max_results)
+    )
+
+    if results:
+        return {"results": results, "query": q, "source": "invidious"}
+
+    # Fallback to yt-dlp
+    try:
+        results = await loop.run_in_executor(pool, lambda: search_youtube(q, max_results))
+        return {"results": results, "query": q, "source": "ytdlp"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/video/fast")
+async def api_video_fast(request: Request, url: str = Query(...)):
+    """
+    Invidious-first video info. ~300ms vs yt-dlp's 3-5s.
+    Returns stream URLs directly from Invidious adaptive formats.
+    Falls back to yt-dlp for stream URLs that need auth tokens refreshed.
+    """
+    loop = asyncio.get_event_loop()
+    video_id = extract_video_id(url)
+
+    invidious_info = None
+    if video_id:
+        invidious_info = await loop.run_in_executor(
+            pool, lambda: invidious_video_info(video_id)
+        )
+
+    if invidious_info:
+        adaptive = invidious_info.get("adaptiveFormats", [])
+        progressive = invidious_info.get("formatStreams", [])
+
+        # Build quality list from qualityLabel (e.g. "1080p", "720p60", "480p")
+        # Invidious uses qualityLabel NOT resolution
+        def _label_to_height(label: str) -> int:
+            import re
+            m = re.match(r"(\d+)", label or "")
+            return int(m.group(1)) if m else 0
+
+        quality_labels_seen = []
+        for f in adaptive:
+            ql = f.get("qualityLabel", "")
+            if ql and f.get("type", "").startswith("video/"):
+                quality_labels_seen.append(ql)
+
+        # Also add progressive stream labels
+        for f in progressive:
+            ql = f.get("qualityLabel", "")
+            if ql:
+                quality_labels_seen.append(ql)
+
+        # Map to our quality bucket names, preserving 60fps variants
+        qualities = []
+        for ql in quality_labels_seen:
+            h = _label_to_height(ql)
+            is_60 = "60" in ql
+            if h >= 1440:
+                qualities.append("2k")
+            elif h >= 1080 and is_60:
+                qualities.append("1080p60")
+            elif h >= 1080:
+                qualities.append("1080p")
+            elif h >= 720 and is_60:
+                qualities.append("720p60")
+            elif h >= 720:
+                qualities.append("720p")
+            elif h >= 480:
+                qualities.append("480p")
+            elif h >= 360:
+                qualities.append("360p")
+            elif h >= 240:
+                qualities.append("240p")
+            elif h >= 144:
+                qualities.append("144p")
+
+        # Deduplicate while preserving order (highest first)
+        ORDER = ["2k","1080p60","1080p","720p60","720p","480p","360p","240p","144p"]
+        qualities = [q for q in ORDER if q in set(qualities)] or ["360p"]
+
+        # Pick best stream URLs for default quality
+        v_url, a_url = pick_stream_urls(adaptive, progressive, qualities[0])
+
+        # Progressive (merged) streams — directly playable in <video>
+        # These are usually 360p and below.
+        formats_for_browser = []
+        for f in progressive:
+            if f.get("url"):
+                ql = f.get("qualityLabel", "")
+                h = _label_to_height(ql)
+                formats_for_browser.append({
+                    "url": f["url"],
+                    "height": h,
+                    "qualityLabel": ql,
+                    "ext": f.get("container", "mp4"),
+                    "acodec": "aac",
+                    "vcodec": "h264",
+                    "protocol": "https",
+                    "hls_required": False,
+                })
+
+        # Adaptive (split) video formats — require HLS transcoding to play in browser
+        for f in adaptive:
+            if f.get("url") and f.get("type", "").startswith("video/"):
+                ql = f.get("qualityLabel", "")
+                h = _label_to_height(ql)
+                if h > 0:
+                    formats_for_browser.append({
+                        "url": f["url"],
+                        "height": h,
+                        "qualityLabel": ql,
+                        "ext": f.get("container", "mp4"),
+                        "acodec": "none",
+                        "vcodec": f.get("encoding", "h264"),
+                        "protocol": "https",
+                        "hls_required": True,
+                    })
+
+        # Deduplicate by height — prefer non-HLS (progressive) for each height
+        seen_h: set[int] = set()
+        deduped = []
+        for fmt in sorted(formats_for_browser, key=lambda x: (x["height"], x["hls_required"])):
+            if fmt["height"] not in seen_h:
+                seen_h.add(fmt["height"])
+                deduped.append(fmt)
+        formats_for_browser = sorted(deduped, key=lambda x: -x["height"])
+
+        # Get recommended videos for sidebar
+        recs = await loop.run_in_executor(
+            pool, lambda: get_recommended(video_id, 12)
+        )
+
+        return {
+            "videoId": url,
+            "videoIdRaw": video_id,
+            "title": invidious_info.get("title", "Untitled"),
+            "description": invidious_info.get("description", ""),
+            "uploader": invidious_info.get("author", "Unknown"),
+            "uploader_url": invidious_info.get("authorUrl", ""),
+            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+            "duration": invidious_info.get("lengthSeconds"),
+            "view_count": invidious_info.get("viewCount"),
+            "like_count": invidious_info.get("likeCount"),
+            "qualities": qualities,
+            "best_url": v_url or "",
+            "audio_url": a_url,
+            "formats": formats_for_browser,
+            "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+            "recommended": recs,
+            "source": "invidious",
+        }
+
+    # Fallback to yt-dlp
+    try:
+        info = await loop.run_in_executor(pool, lambda: extract_formats(url))
+        buckets = available_buckets(info)
+        formats_for_browser = []
+        for f in info.get("formats", []):
+            if f.get("url") and f.get("height"):
+                formats_for_browser.append({
+                    "url": f["url"], "height": f.get("height"),
+                    "fps": f.get("fps"), "ext": f.get("ext"),
+                    "acodec": f.get("acodec","none"),
+                    "vcodec": f.get("vcodec","none"),
+                    "tbr": f.get("tbr"),
+                    "protocol": f.get("protocol",""),
+                })
+        return {
+            "videoId": url,
+            "videoIdRaw": video_id or "",
+            "title": info.get("title","Untitled"),
+            "description": info.get("description",""),
+            "uploader": info.get("uploader","Unknown"),
+            "uploader_url": info.get("uploader_url",""),
+            "thumbnail": info.get("thumbnail",""),
+            "duration": info.get("duration"),
+            "view_count": info.get("view_count"),
+            "like_count": info.get("like_count"),
+            "qualities": buckets,
+            "best_url": info.get("url",""),
+            "audio_url": None,
+            "formats": formats_for_browser,
+            "webpage_url": info.get("webpage_url") or info.get("original_url") or url,
+            "recommended": [],
+            "source": "ytdlp",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Prefetch endpoint (called on thumbnail hover)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/prefetch")
+async def api_prefetch(body: dict):
+    """
+    Browser calls this on thumbnail hover. Starts background resolution
+    so stream is ready before the user clicks.
+    """
+    url = body.get("url")
+    quality = body.get("quality", "720p")
+    start_hls = body.get("start_hls", False)  # opt-in to pre-warm ffmpeg
+    if not url:
+        return {"status": "ignored"}
+
+    await app.state.prefetch.prefetch(url, quality=quality, start_hls=start_hls)
+
+    # Return any already-cached HLS session ID
+    hls_id = app.state.prefetch.get_hls_session_id(url)
+    return {"status": "prefetching", "hls_session_id": hls_id}
+
+
+@app.get("/api/prefetch/status")
+async def api_prefetch_status(url: str = Query(...)):
+    cached = app.state.prefetch.get_cached(url)
+    hls_id = app.state.prefetch.get_hls_session_id(url)
+    return {
+        "cached": cached is not None,
+        "hls_session_id": hls_id,
+        "hls_ready": (
+            app.state.hls.get(hls_id).segments_ready()
+            if hls_id and app.state.hls.get(hls_id) else False
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# MPV launch with browser mirror
+# ---------------------------------------------------------------------------
+
+@app.post("/api/mpv/launch")
+async def api_mpv_launch(body: dict):
+    url = body.get("url")
+    quality = body.get("quality", "360p")
+    start_time = body.get("start_time", 0.0)
+    detached = body.get("detached", True)
+    low_latency = body.get("low_latency", False)
+    with_mirror = body.get("with_browser_mirror", True)
+    if not url:
+        raise HTTPException(status_code=400, detail="url required")
+
+    hls_playlist = app.state.mpv.launch(
+        url=url,
+        quality_label=quality,
+        start_time=start_time,
+        detached=detached,
+        low_latency=low_latency,
+        with_browser_mirror=with_mirror,
+    )
+    return {
+        "status": "launched",
+        "quality": quality,
+        "mirror_playlist": hls_playlist,  # None if mirror unavailable
+        "mirror_active": hls_playlist is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Invidious health / instance list
+# ---------------------------------------------------------------------------
+
+@app.get("/api/invidious/instances")
+async def api_invidious_instances():
+    loop = asyncio.get_event_loop()
+    instances = await loop.run_in_executor(pool, lambda: get_healthy_instances(force=True))
+    return {"instances": instances, "count": len(instances)}

@@ -218,7 +218,14 @@
     spinner.hidden = false;
 
     try {
-      // Use last search query or video title as suggestion seed
+      // Prefer recommended videos from the video info response (Invidious provides these)
+      const recs = currentVideoInfo?.recommended;
+      if (recs && recs.length > 0) {
+        spinner.hidden = true;
+        BorgorSearch.populateSuggested("suggested-list", recs, (v) => loadVideo(v.videoId));
+        return;
+      }
+      // Fallback: search-based suggestions
       const seed = $searchInput.value.trim() || (currentVideoInfo?.title || "");
       const data = await BorgorAPI.search(seed, 10);
       spinner.hidden = true;

@@ -41,7 +41,8 @@ FORMAT_MAPPING = {
     "1080p":   "bestvideo[height>=1080][vcodec^=avc]+bestaudio/bestvideo[height>=1080]+bestaudio/best",
     "720p60":  "bestvideo[height>=720][fps>=60][vcodec^=avc]+bestaudio/bestvideo[height>=720][fps>=60]+bestaudio/best",
     "720p":    "bestvideo[height>=720][height<1080][vcodec^=avc]+bestaudio/bestvideo[height>=720][height<1080]+bestaudio/best",
-    "360p":    "bestvideo[height>=360][height<720][vcodec^=avc]+bestaudio/bestvideo[height>=360][height<720]+bestaudio/best",
+    "480p":    "bestvideo[height>=480][height<720][vcodec^=avc]+bestaudio/bestvideo[height>=480][height<720]+bestaudio/best",
+    "360p":    "bestvideo[height>=360][height<480][vcodec^=avc]+bestaudio/bestvideo[height>=360][height<480]+bestaudio/best",
     "240p":    "bestvideo[height>=240][height<360][vcodec^=avc]+bestaudio/bestvideo[height>=240][height<360]+bestaudio/best",
     "144p":    "bestvideo[height>=144][height<240][vcodec^=avc]+bestaudio/bestvideo[height>=144][height<240]+bestaudio/best",
 }

@@ -45,36 +45,49 @@ window.BorgorPlayer = (() => {
    * typically a merged/progressive fallback at lower quality.
    * Full adaptive streaming via MPV is handled in the pop-out path.
    */
+  /**
+   * Returns a direct stream URL only for formats that don't need HLS.
+   * Anything with hls_required=true must go through the HLS path.
+   * Returns null to force HLS when no direct URL works for the quality.
+   */
   function pickStreamUrl(info, qualityLabel) {
     const formats = info.formats || [];
-
-    // 1. Look for a merged (has both video + audio) format matching quality
     const targetH = qualityLabel
-      ? parseInt(qualityLabel.replace("p", "").replace("k", "440").replace("60", ""))
+      ? parseInt(qualityLabel.replace("p60","").replace("p","").replace("k","440"))
       : 360;
 
-    const merged = formats.filter(
-      (f) =>
-        f.acodec !== "none" &&
-        f.vcodec !== "none" &&
-        f.height >= targetH
+    // Only use direct URL for progressive (merged) formats — not hls_required
+    const direct = formats.filter(
+      (f) => !f.hls_required && f.acodec !== "none" && f.vcodec !== "none" && f.url
     );
-    if (merged.length > 0) {
-      merged.sort((a, b) => (b.tbr || 0) - (a.tbr || 0));
-      return merged[0].url;
+
+    // Find the direct format closest to target height (prefer at or below target)
+    const exact = direct.filter((f) => (f.height || 0) >= targetH);
+    if (exact.length > 0) {
+      exact.sort((a, b) => (a.height || 0) - (b.height || 0));
+      return exact[0].url;
     }
 
-    // 2. HLS manifest URL
-    if (info.best_url && (info.best_url.includes(".m3u8") || info.best_url.includes("manifest"))) {
-      return info.best_url;
+    // Any direct format as last resort
+    if (direct.length > 0) {
+      direct.sort((a, b) => (b.height || 0) - (a.height || 0));
+      return direct[0].url;
     }
 
-    // 3. Fallback: the best progressive URL yt-dlp resolved
-    if (info.best_url) return info.best_url;
+    // HLS manifest fallback
+    if (info.best_url?.includes(".m3u8")) return info.best_url;
 
-    // 4. Any URL from formats
-    const anyFormat = formats.find((f) => f.url);
-    return anyFormat ? anyFormat.url : null;
+    // For anything requiring HLS, return null to trigger the HLS path
+    return null;
+  }
+
+  /**
+   * Returns true if the given quality requires HLS (ffmpeg transcode).
+   * Anything above 360p on YouTube is split video+audio and needs HLS.
+   */
+  function qualityNeedsHLS(qualityLabel) {
+    const noHLS = ["360p", "240p", "144p"];  // these have merged progressive streams
+    return !noHLS.includes(qualityLabel);
   }
 
   // ── Browser <video> playback ──────────────────────────────────────────
@@ -103,15 +116,9 @@ window.BorgorPlayer = (() => {
     const q = $qualitySelect.value;
     const ll = $chkLowLatency ? $chkLowLatency.checked : false;
 
-    // If HLS is active, switch quality via HLS session
-    if (window.BorgorHLS && BorgorHLS.isActive() && $video) {
-      setPlayerMode("hls-loading");
-      const result = await BorgorHLS.changeQuality(currentUrl, q, $video, ll);
-      if (result.ok) { setPlayerMode("hls"); }
-      else           { setPlayerMode("direct"); loadInBrowser(currentInfo, q); }
-    } else {
-      loadInBrowser(currentInfo, q);
-    }
+    // Always restart HLS for quality changes — it needs a new ffmpeg session
+    // with the right format string for the new quality
+    await loadWithHLSFallback(currentInfo, q);
 
     // If MPV pop-out is running, restart it at same position with new quality
     BorgorAPI.mpvStatus().then((status) => {
@@ -120,6 +127,7 @@ window.BorgorPlayer = (() => {
           url: currentUrl, quality: q,
           start_time: status.time_pos || 0,
           detached: true, low_latency: ll,
+          with_browser_mirror: true,
         });
       }
     }).catch(() => {});
@@ -137,13 +145,34 @@ window.BorgorPlayer = (() => {
       quality: q,
       start_time: t,
       detached: true,
-      low_latency: $chkLowLatency.checked,
+      low_latency: $chkLowLatency?.checked || false,
+      with_browser_mirror: true,
     })
-      .then(() => {
+      .then((res) => {
         showToast(`MPV launched at ${q}`);
         startMpvPoll();
+        // If server started a mirror HLS stream, switch browser player to it
+        if (res.mirror_active && res.mirror_playlist && $video) {
+          showToast('Browser mirroring MPV output…', 4000);
+          setPlayerMode('hls-loading');
+          // Give mpv ~2s to start writing to the pipe before attaching
+          setTimeout(async () => {
+            if (window.BorgorHLS) await BorgorHLS.stop();
+            if (window.Hls && Hls.isSupported()) {
+              const hls = new Hls({ lowLatencyMode: true, backBufferLength: 5 });
+              hls.loadSource(res.mirror_playlist);
+              hls.attachMedia($video);
+              hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                $video.play().catch(() => {});
+                setPlayerMode('hls');
+                const badge = document.getElementById('player-mode-badge');
+                if (badge) { badge.textContent = 'MPV MIRROR'; badge.className = 'mode-badge mode-hls'; }
+              });
+            }
+          }, 2000);
+        }
       })
-      .catch((e) => showToast("MPV error: " + e.message));
+      .catch((e) => showToast('MPV error: ' + e.message));
   }
 
   function killMpv() {
@@ -244,7 +273,11 @@ window.BorgorPlayer = (() => {
    * Falls back to direct stream URL if HLS unavailable.
    */
   async function loadWithHLSFallback(info, qualityLabel) {
-    if (window.BorgorHLS && $video) {
+    const forceHLS = qualityNeedsHLS(qualityLabel);
+    const directUrl = forceHLS ? null : pickStreamUrl(info, qualityLabel);
+
+    // Always use HLS for anything above 360p (YouTube split streams)
+    if (window.BorgorHLS && $video && (forceHLS || !directUrl)) {
       try {
         setPlayerMode("hls-loading");
         const result = await BorgorHLS.load(
@@ -252,17 +285,22 @@ window.BorgorPlayer = (() => {
         );
         if (result.ok) {
           setPlayerMode("hls");
-          // Overlay is cleared by hls.js MANIFEST_PARSED, but ensure it's
-          // gone regardless after a short grace period.
-          setTimeout(() => {
-            if ($overlay) $overlay.hidden = true;
-          }, 3000);
+          setTimeout(() => { if ($overlay) $overlay.hidden = true; }, 3000);
           return;
         }
       } catch (e) {
         console.warn("[Player] HLS load error:", e.message);
       }
+      // HLS failed for a quality that needs it — fall through to direct if possible
+      if (forceHLS) {
+        setPlayerMode("direct");
+        showToast("HLS unavailable — try MPV pop-out for HD quality");
+        if ($overlay) $overlay.hidden = true;
+        return;
+      }
     }
+
+    // Direct URL playback (360p and below)
     setPlayerMode("direct");
     loadInBrowser(info, qualityLabel);
   }

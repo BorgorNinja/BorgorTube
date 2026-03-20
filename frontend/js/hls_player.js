@@ -204,10 +204,15 @@ window.BorgorHLS = (() => {
   // ── Quality change ───────────────────────────────────────────────────
 
   async function changeQuality(videoUrl, newQuality, videoEl, lowLatency) {
+    // Capture position before stopping — load() calls stop() which resets video
     const currentTime = videoEl ? videoEl.currentTime : 0;
+
+    // Stop current session and start a new one for the new quality.
+    // Each quality needs its own ffmpeg session with the right FORMAT_MAPPING.
     const result = await load(videoUrl, newQuality, videoEl, lowLatency);
-    // Seek to previous position once manifest is parsed
-    if (result.ok && videoEl) {
+
+    // Seek to previous position once the new stream is ready
+    if (result.ok && videoEl && currentTime > 2) {
       const seekOnce = () => {
         videoEl.currentTime = currentTime;
         videoEl.removeEventListener("canplay", seekOnce);

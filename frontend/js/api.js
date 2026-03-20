@@ -29,7 +29,12 @@ async function apiFetch(path, options = {}) {
 window.BorgorAPI = {
 
   async search(query, maxResults = 20) {
-    return apiFetch(`/api/search?q=${encodeURIComponent(query)}&max_results=${maxResults}`);
+    // Try fast Invidious path first, fallback to yt-dlp
+    try {
+      return await apiFetch(`/api/search/fast?q=${encodeURIComponent(query)}&max_results=${maxResults}`);
+    } catch {
+      return apiFetch(`/api/search?q=${encodeURIComponent(query)}&max_results=${maxResults}`);
+    }
   },
 
   async history() {
@@ -39,7 +44,23 @@ window.BorgorAPI = {
   // ── Video ──────────────────────────────────────────────────────────
 
   async getVideo(url) {
-    return apiFetch(`/api/video?url=${encodeURIComponent(url)}`);
+    // Try fast Invidious path first (~300ms), fallback to yt-dlp (~3-5s)
+    try {
+      return await apiFetch(`/api/video/fast?url=${encodeURIComponent(url)}`);
+    } catch {
+      return apiFetch(`/api/video?url=${encodeURIComponent(url)}`);
+    }
+  },
+
+  async prefetch(url, quality = "720p", startHls = false) {
+    return apiFetch("/api/prefetch", {
+      method: "POST",
+      body: JSON.stringify({ url, quality, start_hls: startHls }),
+    }).catch(() => {});  // fire-and-forget, never throw
+  },
+
+  async prefetchStatus(url) {
+    return apiFetch(`/api/prefetch/status?url=${encodeURIComponent(url)}`);
   },
 
   // ── Channel ────────────────────────────────────────────────────────
@@ -58,10 +79,10 @@ window.BorgorAPI = {
 
   // ── MPV ────────────────────────────────────────────────────────────
 
-  async mpvLaunch({ url, quality = "360p", start_time = 0, detached = true, low_latency = false }) {
+  async mpvLaunch({ url, quality = "360p", start_time = 0, detached = true, low_latency = false, with_browser_mirror = true }) {
     return apiFetch("/api/mpv/launch", {
       method: "POST",
-      body: JSON.stringify({ url, quality, start_time, detached, low_latency }),
+      body: JSON.stringify({ url, quality, start_time, detached, low_latency, with_browser_mirror }),
     });
   },
 
